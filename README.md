@@ -1,5 +1,7 @@
 # ps2-native-recomp
 
+> **This copy** is the fork [Flipendo Droid](https://github.com/Ihor-Ihorevych/flipendo-droid) runs its PS2 games on (Harry Potter and the Chamber of Secrets for Android): see [flipendo/README.md](flipendo/README.md). Everything below is the upstream project's text.
+
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
 main processor is translated to C++ and compiled, and the rest of the console is emulated. 55 games work as far as they
 have been tested, 35 of them out of the box, with zero game-specific code. God of War II has been played from start to

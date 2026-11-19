@@ -86,3 +86,6 @@ __pycache__/
 *.jks
 /android/out/
 /android/libs/
+
+# Flipendo Droid builds
+/flipendo-deps/
