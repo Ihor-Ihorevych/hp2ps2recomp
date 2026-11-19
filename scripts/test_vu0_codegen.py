@@ -376,7 +376,7 @@ with tempfile.TemporaryDirectory(prefix='vu0-codegen-') as tmp:
     base = [CXX, '-std=c++20', '-O1', '-I.', '-Iruntime/include', '-Iruntime/src', '-I' + str(tmp), '-DCALL_PROGRAMS=%d' % CALL_PROGRAMS]
     run(base + [str(tmp / 'generator.cpp'), '-o', str(tmp / 'generator')])
     run([str(tmp / 'generator'), str(tmp)])
-    run(base + [str(tmp / 'driver.cpp'), 'runtime/src/vu_micro.cpp', 'runtime/src/vu_jit_web.cpp']
+    run(base + [str(tmp / 'driver.cpp'), 'runtime/src/vu_micro.cpp', 'runtime/src/vu_jit_web.cpp', 'runtime/src/prof.cpp', 'tests/prov_stub.cpp']
         + [str(p) for p in sorted(tmp.glob('vu1_*.cpp'))] + ['-o', str(tmp / 'check')])
     record = tmp / 'recorded-vu0'
     environment = {k: v for k, v in os.environ.items() if k not in ('PS2_VU0_INTERPRET', 'PS2_VU0_VERIFY', 'PS2_VU0_RECORD', 'PS2_VU0_STATS')}

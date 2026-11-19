@@ -251,7 +251,7 @@ with (contextlib.nullcontext(os.environ['VU_KEEP']) if os.environ.get('VU_KEEP')
     sys.stdout.write(result.stdout)
     if result.returncode:
         sys.exit('the keys or the generated programs are wrong')
-    compile_(*base, '-O1', '-w', '-Iruntime/src', str(tmp / 'run.cpp'), str(tmp / 'compiled.cpp'), 'runtime/src/vu_micro.cpp', 'runtime/src/vu_jit_web.cpp', '-o', str(tmp / 'run'))
+    compile_(*base, '-O1', '-w', '-Iruntime/src', str(tmp / 'run.cpp'), str(tmp / 'compiled.cpp'), 'runtime/src/vu_micro.cpp', 'runtime/src/vu_jit_web.cpp', 'runtime/src/prof.cpp', 'tests/prov_stub.cpp', '-o', str(tmp / 'run'))
     reference = subprocess.run([str(tmp / 'run'), 'interpreter'], cwd=ROOT, capture_output=True, text=True, check=True).stdout.splitlines()
     compiled = subprocess.run([str(tmp / 'run'), 'compiled'], cwd=ROOT, capture_output=True, text=True, check=True).stdout.splitlines()
     if len(reference) != len(compiled) or not reference:
