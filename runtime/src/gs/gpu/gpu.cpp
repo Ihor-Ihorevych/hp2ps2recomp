@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #ifdef __linux__
 #include <pthread.h>
 #endif
@@ -86,8 +87,13 @@ WGPUPresentMode g_present_mode = WGPUPresentMode_Fifo;
 std::uint32_t g_frame_latency = 0;  // pictures the swap chain may keep in flight; 0 = the library's default (2)
 std::uint32_t g_surface_width = 0, g_surface_height = 0;
 WGPURenderPipeline g_blit = nullptr;
+// PS2_BLIT_CHECK=<file>: a second present pass from that WGSL file (the blit to compare with, e.g. blit.wgsl before a change), drawn
+// with g_blit into two textures of the window's size after every timed present of a PS2_GPU_PROFILE window run; the bytes are compared
+// and a line "[blit-check]" says how many window pixels differ (a measuring aid for changes to blit.wgsl: they must give the same pixels)
+WGPURenderPipeline g_blit_ref = nullptr;
 WGPUBindGroup g_blit_group = nullptr;
 WGPUBuffer g_blit_params = nullptr;
+DisplaySource g_last_src = {};
 // The overlay (overlay.hpp): the quick menu's panel, drawn over the game's picture in the present pass with alpha blending. Its pixels
 // sit in a storage buffer like everything else here (no texture: the same code on every backend and in the browser build).
 struct Overlay {
@@ -101,6 +107,7 @@ struct Overlay {
 } g_overlay;
 unsigned long long g_submit_site[16] = {};  // debug: submits by call site (printed with the submit count)
 std::uint32_t g_field = 0, g_last_width = 0, g_last_height = 0;
+std::uint32_t g_picture_epoch = 0;  // counts what changes the picture without the game drawing: the quick menu's panel, a loaded state, a new swap chain
 bool g_have_previous = false;
 // The present pass reads a prepared picture (blit.wgsl prep_mem / prep_tex): `scene` holds the field, or the blend of the two latest fields,
 // at the size the display gives (scaled memory: width x height x SCALE; a target shown straight (hwr::display_target): its card texels).
@@ -121,6 +128,7 @@ struct PresentPrep {
 } g_prep;
 std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
 std::uint32_t g_sharp_2d = 1;
+bool g_scale_edges = true;  // PS2_SCALE_EDGES=0: upscaled 2D pieces drawn as triangles may read past their texels (EDGE_CLAMP in gs.wgsl)
 
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
 
@@ -145,6 +153,9 @@ WGPUComputePipeline g_pipelines[kPipelines] = {};
 // The draw program with mipmap levels (HAS_MIP = true in gs.wgsl) takes as long to translate as all the others together on FXC, so it is built
 // in the background after the plain programs; a batch that needs it waits for it (pipeline_of), every other batch never does.
 WGPUComputePipeline g_raster_mip = nullptr;
+// The draw program for batches whose tile lists are kept per strip (PS2_GPU_STRIPS, STRIPS in gs.wgsl), plain and with mipmap levels (built with
+// g_raster_mip); nullptr without strips.
+WGPUComputePipeline g_raster_strips = nullptr, g_raster_strips_mip = nullptr;
 std::thread *g_raster_mip_thread = nullptr;  // never destroyed: a running thread's destructor at exit would end the program
 std::atomic<bool> g_raster_mip_ready{false};
 std::mutex g_raster_mip_lock;
@@ -154,12 +165,14 @@ struct Command {
     std::uint32_t x, y;
     std::uint32_t param;
     bool mip = false;  // kRaster only: the batch carries a mipmap table, so it needs the draw program built with HAS_MIP (g_raster_mip)
+    bool strips = false;  // kRaster only: the batch's tile lists are kept per strip (g_raster_strips)
     std::uint32_t meta = 0xFFFFFFFFu;  // kRaster only: index into g_run_meta (what the run reads and writes), for fuse_runs
 };
 
 // The program a draw command runs. A batch with a mipmap table runs the HAS_MIP program, and waits here, once, until it is built.
 WGPUComputePipeline pipeline_of(const Command &c) {
-    if (!c.mip || c.pipeline != kRaster) return g_pipelines[c.pipeline];
+    if (c.pipeline != kRaster) return g_pipelines[c.pipeline];
+    if (!c.mip) return c.strips ? g_raster_strips : g_pipelines[kRaster];
     if (!g_raster_mip_ready.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(g_raster_mip_lock);
         if (!g_raster_mip_ready.load(std::memory_order_acquire)) {
@@ -169,6 +182,7 @@ WGPUComputePipeline pipeline_of(const Command &c) {
             std::fprintf(stderr, "[gpu] waited %.0f ms for the mipmap draw program\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
         }
     }
+    if (c.strips) return g_raster_strips_mip ? g_raster_strips_mip : g_raster_strips;
     return g_raster_mip ? g_raster_mip : g_pipelines[kRaster];
 }
 
@@ -815,6 +829,15 @@ bool exact_clear(const std::uint32_t *rec, const std::uint32_t *setup, int minx,
 }
 
 int g_tile = 8;  // pixels along one side of a screen tile (one workgroup of the raster program): 8 was the cheaper of 16, 8 and 4 on the arena and hall test frames; PS2_TILE=4, 8 or 16 to try others
+// PS2_GPU_STRIPS=1: the tile lists are kept per two pixel rows of a tile (tiles.hpp, configure), so each group of 16 threads of the raster program walks only
+// the shapes whose box reaches its rows (STRIPS in gs.wgsl). Off by default; =0 turns it off.
+bool g_strips = false;
+// PS2_GPU_STRIPS=2: split tiles (SPLIT in gs.wgsl): the lists stay per tile, but every strip of two rows is drawn by a workgroup of its own that walks
+// its tile's whole list. The processor's work is that of strips off; the batches run the strip programs (g_raster_strips, built with SPLIT), so
+// Command::strips is set for every batch. Off by default; tiles of 4 or 8 pixels, not with the card path.
+bool g_split = false;
+const char *g_split_why = "";
+double g_strip_ratio = 4.0;  // see PS2_GPU_STRIPS_RATIO in init
 
 WGPUStringView view(const char *s) { return WGPUStringView{s, WGPU_STRLEN}; }
 
@@ -1022,25 +1045,46 @@ bool reads_own_word(const std::uint32_t *rec, const std::uint32_t *setup) {
     const int ox = texel(uv[0], uv[3], f[0], f[2], x0) - x0;
     if (texel(uv[0], uv[3], f[0], f[2], x1) - x1 != ox) return false;
     const auto wide = [](std::uint32_t psm) { return psm == PSMCT32 || psm == PSMCT24 || psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH; };
-    if (ox == 0) return tpsm == fpsm || (wide(fpsm) && wide(tpsm));
-    const bool half = fpsm == PSMCT16 || fpsm == PSMCT16S;
-    return half && tpsm == fpsm && (ox == 8 || ox == -8) && x1 - x0 < 8 && (x0 & 8) == (x1 & 8) && ((x0 ^ 8) == x0 + ox);
+    // A 16-bit sprite that reads the other half of its word (x ^ 8, a channel shuffle) reads the batch copy like any other: the pixel at x ^ 8
+    // may write that half in the same batch (a second sprite over the other 8 pixels), and nothing orders its write after this read. The pair
+    // sits in two different tiles, so no barrier could (follows upstream 7812d21).
+    return ox == 0 && (tpsm == fpsm || (wide(fpsm) && wide(tpsm)));
 }
 
-Range read_range(const std::uint32_t *rec, const std::uint32_t *setup, const Range &whole) {
-    if ((rec[1] & kKindMask) != 1 || !(setup[0] & 16u)) return whole;
-    // Wrap mode 3 (region repeat) reads (u & MINU) | MAXU, which need not lie between the corners of the sprite: the range is that of the words it can touch, else the whole texture.
-    if (region_repeat(setup)) {
-        Range r;
-        return sprite_read_range(rec, setup, static_cast<int>(rec[2] & 0xFFFFu), static_cast<int>(rec[2] >> 16), static_cast<int>(rec[3] & 0xFFFFu), static_cast<int>(rec[3] >> 16), r) ? r : whole;
-    }
+// The rectangle of texels (u0..u1, v0..v1, inclusive) that a sprite can read, with a texel to spare on each side for the filter. Whole texture when it
+// cannot be said: not a sprite, no texture, or a rectangle that leaves the texture where the wrap mode would bring it round to the other side.
+// Clamp (mode 1) may leave it by the spare texel: those reads land on the edge, so the rectangle is cut back to the texture.
+bool read_rect(const std::uint32_t *rec, const std::uint32_t *setup, int &u0, int &v0, int &u1, int &v1) {
+    const int tw = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1), th = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1);
+    u0 = v0 = 0;
+    u1 = tw - 1;
+    v1 = th - 1;
+    if ((rec[1] & kKindMask) != 1 || !(setup[0] & 16u)) return false;
+    // Wrap mode 3 (region repeat) reads (u & MINU) | MAXU, which need not lie between the corners of the sprite: no rectangle (repeat_range works out its words instead).
+    if (region_repeat(setup)) return false;
     float uv[6];
     std::memcpy(uv, rec + 15, sizeof uv);
-    const int u0 = static_cast<int>(std::floor(std::min(uv[0], uv[3]) / 16.0f)) - 1, u1 = static_cast<int>(std::ceil(std::max(uv[0], uv[3]) / 16.0f)) + 1;
-    const int v0 = static_cast<int>(std::floor(std::min(uv[1], uv[4]) / 16.0f)) - 1, v1 = static_cast<int>(std::ceil(std::max(uv[1], uv[4]) / 16.0f)) + 1;
-    const int tw = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1), th = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1);
-    if (u0 < 0 || v0 < 0 || u1 >= tw || v1 >= th) return whole;
-    return region(setup[12], setup[13], setup[14], u0, v0, u1, v1);
+    int a0 = static_cast<int>(std::floor(std::min(uv[0], uv[3]) / 16.0f)) - 1, a1 = static_cast<int>(std::ceil(std::max(uv[0], uv[3]) / 16.0f)) + 1;
+    int b0 = static_cast<int>(std::floor(std::min(uv[1], uv[4]) / 16.0f)) - 1, b1 = static_cast<int>(std::ceil(std::max(uv[1], uv[4]) / 16.0f)) + 1;
+    const auto clamped = [](std::uint32_t mode, int &lo, int &hi, int size) {
+        if (lo >= 0 && hi < size) return true;
+        if (mode != 1 || lo + 1 < 0 || hi - 1 >= size) return false;
+        lo = std::max(lo, 0);
+        hi = std::min(hi, size - 1);
+        return true;
+    };
+    if (!clamped((setup[7] >> 24) & 3u, a0, a1, tw) || !clamped((setup[7] >> 26) & 3u, b0, b1, th)) return false;
+    u0 = a0;
+    v0 = b0;
+    u1 = a1;
+    v1 = b1;
+    return true;
+}
+
+// The words from the first to the last that a region-repeat sprite can touch (the rectangle of read_rect does not hold its reads), else the whole texture.
+Range repeat_range(const std::uint32_t *rec, const std::uint32_t *setup, const Range &whole) {
+    Range r;
+    return sprite_read_range(rec, setup, static_cast<int>(rec[2] & 0xFFFFu), static_cast<int>(rec[2] >> 16), static_cast<int>(rec[3] & 0xFFFFu), static_cast<int>(rec[3] >> 16), r) ? r : whole;
 }
 
 Range pages(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, int x0, int y0, int x1, int y1) {
@@ -1148,14 +1192,14 @@ void everything_fresh() {
 }
 
 // A host-to-local upload (`rec` as queue_upload builds it: dbp, dbw, dpsm, dsax, dsay, rrw, done, pixels, offset, lead bits, bits per pixel) of
-// bytes whose number is `content`.
-void id_upload(const std::uint32_t *rec, std::uint64_t content) {
+// bytes whose number is `content`. Returns true when any cell's block identity changed.
+bool id_upload(const std::uint32_t *rec, std::uint64_t content) {
     const std::uint32_t rrw = rec[5], done = rec[6], pixels = rec[7], psm = rec[2];
-    if (!rrw || !pixels) return;
+    if (!rrw || !pixels) return false;
     const std::uint32_t x0 = rec[3], x1 = rec[3] + rrw - 1, y0 = rec[4] + done / rrw, y1 = rec[4] + (done + pixels - 1) / rrw;
     if (x1 > 2047 || y1 > 2047) {  // wraps around the 2048 x 2048 space: not followed, everything counts as written
         everything_fresh();
-        return;
+        return true;
     }
     const std::uint32_t full0 = rec[4] + (done + rrw - 1) / rrw, full_end = rec[4] + (done + pixels) / rrw;  // the rows written whole
     const bool whole_words = psm != 0x01 && psm != 0x31 && psm != 0x1B && psm != 0x24 && psm != 0x2C;
@@ -1164,13 +1208,18 @@ void id_upload(const std::uint32_t *rec, std::uint64_t content) {
     chunk = mix64(chunk, rec[10] & 0x7FFFFFFFu);
     std::uint32_t f[5];
     fmt_words(psm, rec[0], rec[1], f);
+    bool changed = false;
     for_cells(f, x0, y0, x1, y1, [&](std::uint32_t b, std::uint32_t cx0, std::uint32_t cy0, std::uint32_t cx1, std::uint32_t cy1) {
         const bool full = whole_words && cx0 >= x0 && cx1 <= x1 && cy0 >= full0 && cy1 < full_end;
         bool drawn = false;
-        g_id.block[b] = (full ? mix64(chunk, b) : mix64(mix64(block_id(b, drawn), chunk), b)) | 1;
+        const std::uint64_t prev = block_id(b, drawn);
+        const std::uint64_t next = (full ? mix64(chunk, b) : mix64(mix64(prev, chunk), b)) | 1;
+        if (!full || drawn || prev != next) changed = true;
+        g_id.block[b] = next;
         g_id.block_seq[b] = ++g_id.seq;
         g_id.touched[b >> 5] = g_id.block_write[b >> 5] = g_id.seq;
     });
+    return changed;
 }
 
 std::uint64_t bytes_id(const std::uint8_t *p, std::size_t n) {
@@ -1400,6 +1449,8 @@ struct TexIndexEntry {
 };
 
 std::unordered_map<std::uint64_t, TexIndexEntry> g_tex_index;
+std::unordered_map<std::uint64_t, std::uint64_t> g_ident_tex_key;
+bool g_tex_size_in_index[11][11] = {};
 std::vector<std::uint64_t> g_tracked_tex_keys;
 std::uint64_t g_dbp_tex_key[16384] = {};
 std::vector<std::uint8_t> g_state_vram_1x;
@@ -1407,6 +1458,10 @@ std::uint32_t g_override_used = 0;
 bool g_tex_overrides_enabled = false;
 bool g_tex_override_all = false;
 bool g_tex_hot_reload = false;
+bool g_tex_dump_enabled = false;
+std::string g_tex_dump_dir;
+std::unordered_set<std::uint64_t> g_dumped_tex_keys;
+std::vector<std::array<std::uint32_t, kClutEntries>> g_dump_clut;
 
 // Canonical Huffman table construction (Huff::build, decode_huff) and RFC 1951 block
 // decoding in inflate_rfc1951 are derived from Mark Adler's puff.c / puff.h
@@ -1658,6 +1713,231 @@ bool decode_png_rgba_ps2(const std::string &path, std::uint32_t &out_w, std::uin
     return true;
 }
 
+bool write_png_rgba(const std::string &path, std::uint32_t w, std::uint32_t h, const std::uint8_t *rgba) {
+    if (!w || !h || !rgba) return false;
+    const auto crc32_step = [](std::uint32_t crc, const std::uint8_t *buf, std::size_t len) {
+        for (std::size_t i = 0; i < len; ++i) {
+            crc ^= buf[i];
+            for (int k = 0; k < 8; ++k) crc = (crc >> 1u) ^ ((crc & 1u) ? 0xEDB88320u : 0u);
+        }
+        return crc;
+    };
+    const auto put_be32 = [](std::vector<std::uint8_t> &out, std::uint32_t v) {
+        out.push_back(static_cast<std::uint8_t>(v >> 24));
+        out.push_back(static_cast<std::uint8_t>(v >> 16));
+        out.push_back(static_cast<std::uint8_t>(v >> 8));
+        out.push_back(static_cast<std::uint8_t>(v));
+    };
+    const auto put_chunk = [&](std::vector<std::uint8_t> &out, const char type[4], const std::uint8_t *data, std::size_t len) {
+        put_be32(out, static_cast<std::uint32_t>(len));
+        const auto *tbytes = reinterpret_cast<const std::uint8_t *>(type);
+        out.insert(out.end(), tbytes, tbytes + 4);
+        if (len) out.insert(out.end(), data, data + len);
+        std::uint32_t crc = crc32_step(0xFFFFFFFFu, tbytes, 4);
+        if (len) crc = crc32_step(crc, data, len);
+        put_be32(out, ~crc);
+    };
+
+    const std::size_t stride = static_cast<std::size_t>(w) * 4;
+    std::vector<std::uint8_t> raw(static_cast<std::size_t>(h) * (1 + stride), 0);
+    for (std::uint32_t y = 0; y < h; ++y) {
+        const std::uint8_t *src = rgba + static_cast<std::size_t>(y) * stride;
+        const std::uint8_t *up = y > 0 ? (src - stride) : nullptr;
+        std::uint8_t *dst = &raw[static_cast<std::size_t>(y) * (1 + stride)];
+        std::uint64_t score1 = 0, score2 = 0;
+        for (std::size_t i = 0; i < stride; ++i) {
+            const std::uint8_t a = i >= 4 ? src[i - 4] : 0;
+            const std::uint8_t b = up ? up[i] : 0;
+            score1 += static_cast<std::uint32_t>(std::abs(static_cast<std::int8_t>(src[i] - a)));
+            score2 += static_cast<std::uint32_t>(std::abs(static_cast<std::int8_t>(src[i] - b)));
+        }
+        if (score1 <= score2) {
+            dst[0] = 1;
+            for (std::size_t i = 0; i < stride; ++i) dst[1 + i] = static_cast<std::uint8_t>(src[i] - (i >= 4 ? src[i - 4] : 0));
+        } else {
+            dst[0] = 2;
+            for (std::size_t i = 0; i < stride; ++i) dst[1 + i] = static_cast<std::uint8_t>(src[i] - (up ? up[i] : 0));
+        }
+    }
+
+    std::uint32_t s1 = 1, s2 = 0;
+    for (std::uint8_t b : raw) {
+        s1 = (s1 + b) % 65521u;
+        s2 = (s2 + s1) % 65521u;
+    }
+
+    std::vector<std::uint8_t> zstream;
+    zstream.reserve(raw.size() / 2 + 64);
+    zstream.push_back(0x78);
+    zstream.push_back(0x01);
+
+    std::uint64_t bit_buf = 0;
+    int bit_cnt = 0;
+    const auto put_bits = [&](std::uint32_t val, int nbits) {
+        bit_buf |= (static_cast<std::uint64_t>(val) << bit_cnt);
+        bit_cnt += nbits;
+        while (bit_cnt >= 8) {
+            zstream.push_back(static_cast<std::uint8_t>(bit_buf & 0xFFu));
+            bit_buf >>= 8;
+            bit_cnt -= 8;
+        }
+    };
+    const auto put_huff = [&](std::uint32_t code_msb, int nbits) {
+        std::uint32_t rev = 0;
+        for (int i = 0; i < nbits; ++i) rev = (rev << 1u) | ((code_msb >> i) & 1u);
+        put_bits(rev, nbits);
+    };
+    const auto put_lit = [&](int sym) {
+        if (sym <= 143) put_huff(0x30u + static_cast<std::uint32_t>(sym), 8);
+        else if (sym <= 255) put_huff(0x190u + static_cast<std::uint32_t>(sym - 144), 9);
+        else if (sym <= 279) put_huff(static_cast<std::uint32_t>(sym - 256), 7);
+        else put_huff(0xC0u + static_cast<std::uint32_t>(sym - 280), 8);
+    };
+    static const int kLenBase[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+    static const int kLenExtra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+    static const int kDistBase[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+    static const int kDistExtra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+
+    put_bits(1, 1);  // BFINAL = 1
+    put_bits(1, 2);  // BTYPE = 01 (Fixed Huffman)
+    std::array<std::int32_t, 4096> head;
+    head.fill(-1);
+    const auto hash3 = [&](std::size_t p) -> std::uint32_t {
+        const std::uint32_t v = static_cast<std::uint32_t>(raw[p]) | (static_cast<std::uint32_t>(raw[p + 1]) << 8) | (static_cast<std::uint32_t>(raw[p + 2]) << 16);
+        return (v * 0x1E35A7BDu) >> 20;
+    };
+    std::size_t pos = 0;
+    while (pos < raw.size()) {
+        int best_len = 0;
+        std::size_t best_dist = 0;
+        if (pos + 3 <= raw.size()) {
+            const std::uint32_t h3 = hash3(pos);
+            const std::int32_t prev = head[h3];
+            head[h3] = static_cast<std::int32_t>(pos);
+            if (prev >= 0 && pos - static_cast<std::size_t>(prev) <= 32768) {
+                const std::size_t mpos = static_cast<std::size_t>(prev);
+                const std::size_t max_l = std::min<std::size_t>(258, raw.size() - pos);
+                std::size_t l = 0;
+                while (l < max_l && raw[mpos + l] == raw[pos + l]) ++l;
+                if (l >= 3) {
+                    best_len = static_cast<int>(l);
+                    best_dist = pos - mpos;
+                }
+            }
+        }
+        if (best_len >= 3) {
+            int li = 28;
+            while (li > 0 && best_len < kLenBase[li]) --li;
+            put_lit(257 + li);
+            if (kLenExtra[li]) put_bits(static_cast<std::uint32_t>(best_len - kLenBase[li]), kLenExtra[li]);
+            int di = 29;
+            while (di > 0 && static_cast<int>(best_dist) < kDistBase[di]) --di;
+            put_huff(static_cast<std::uint32_t>(di), 5);
+            if (kDistExtra[di]) put_bits(static_cast<std::uint32_t>(static_cast<int>(best_dist) - kDistBase[di]), kDistExtra[di]);
+            for (int step = 1; step < best_len; ++step) {
+                if (pos + step + 3 <= raw.size()) head[hash3(pos + step)] = static_cast<std::int32_t>(pos + step);
+            }
+            pos += static_cast<std::size_t>(best_len);
+        } else {
+            put_lit(raw[pos]);
+            ++pos;
+        }
+    }
+    put_lit(256);
+    if (bit_cnt > 0) zstream.push_back(static_cast<std::uint8_t>(bit_buf & 0xFFu));
+    put_be32(zstream, (s2 << 16) | s1);
+
+    std::vector<std::uint8_t> png = {137, 80, 78, 71, 13, 10, 26, 10};
+    const std::uint8_t ihdr[13] = {
+        static_cast<std::uint8_t>(w >> 24), static_cast<std::uint8_t>(w >> 16), static_cast<std::uint8_t>(w >> 8), static_cast<std::uint8_t>(w),
+        static_cast<std::uint8_t>(h >> 24), static_cast<std::uint8_t>(h >> 16), static_cast<std::uint8_t>(h >> 8), static_cast<std::uint8_t>(h),
+        8, 6, 0, 0, 0
+    };
+    put_chunk(png, "IHDR", ihdr, sizeof ihdr);
+    put_chunk(png, "IDAT", zstream.data(), zstream.size());
+    put_chunk(png, "IEND", nullptr, 0);
+
+    std::FILE *f = os::open(path.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = std::fwrite(png.data(), 1, png.size(), f) == png.size();
+    std::fclose(f);
+    return ok;
+}
+
+std::uint32_t loc_at_1x(const std::uint32_t *f, std::uint32_t x, std::uint32_t y, std::uint32_t &shift, std::uint32_t &mask) {
+    const std::uint32_t pws = f[3] & 15u, phs = (f[3] >> 4) & 15u, amask = (f[3] >> 8) & 3u, nbit = (f[3] >> 10) & 1u;
+    const std::uint32_t n = g_swizzle[f[2] + ((y & ((1u << phs) - 1u)) << pws) + (x & ((1u << pws) - 1u))];
+    const std::uint32_t a = f[0] + ((x >> pws) + (y >> phs) * f[1]) * 8192u + (n >> nbit);
+    shift = (f[3] >> 11u) + (a & amask) * 8u + (n & nbit) * 4u;
+    mask = f[4];
+    return (a & 0x3FFFFFu) >> 2u;
+}
+
+std::uint32_t read_pixel_1x(const std::uint32_t *f, std::uint32_t x, std::uint32_t y) {
+    std::uint32_t shift = 0, mask = 0;
+    const std::uint32_t w = loc_at_1x(f, x, y, shift, mask);
+    std::uint32_t word = 0;
+    std::memcpy(&word, &g_state_vram_1x[w * 4], 4);
+    return (word >> shift) & mask;
+}
+
+void write_pixel_1x(const std::uint32_t *f, std::uint32_t x, std::uint32_t y, std::uint32_t val) {
+    std::uint32_t shift = 0, mask = 0;
+    const std::uint32_t w = loc_at_1x(f, x, y, shift, mask);
+    if (mask == 0xFFFFFFFFu) {
+        std::memcpy(&g_state_vram_1x[w * 4], &val, 4);
+        return;
+    }
+    std::uint32_t word = 0;
+    std::memcpy(&word, &g_state_vram_1x[w * 4], 4);
+    word = (word & ~(mask << shift)) | ((val & mask) << shift);
+    std::memcpy(&g_state_vram_1x[w * 4], &word, 4);
+}
+
+std::uint32_t expand16_1x(std::uint32_t c, const std::uint32_t *w) {
+    const std::uint32_t r = (c & 0x1Fu) << 3u;
+    const std::uint32_t g = ((c >> 5u) & 0x1Fu) << 3u;
+    const std::uint32_t b = ((c >> 10u) & 0x1Fu) << 3u;
+    const std::uint32_t ta0 = w[20] & 0xFFu, ta1 = (w[20] >> 8u) & 0xFFu;
+    std::uint32_t a = ta0;
+    if (c & 0x8000u) a = ta1;
+    else if ((w[0] & 32768u) && (c & 0x7FFFu) == 0u) a = 0u;
+    return r | (g << 8u) | (b << 16u) | (a << 24u);
+}
+
+std::uint32_t convert_texel_1x(const std::uint32_t *w, std::uint32_t raw) {
+    const std::uint32_t tpsm = w[14], cpsm = w[16], csa = w[17], clut_slot = w[22] % kClutSlots;
+    switch (tpsm) {
+    case 0x00u:
+    case 0x30u:
+        return raw;
+    case 0x01u:
+    case 0x31u: {
+        std::uint32_t a = w[20] & 0xFFu;
+        if ((w[0] & 32768u) && (raw & 0xFFFFFFu) == 0u) a = 0u;
+        return (raw & 0xFFFFFFu) | (a << 24u);
+    }
+    case 0x02u:
+    case 0x0Au:
+    case 0x32u:
+    case 0x3Au:
+        return expand16_1x(raw, w);
+    case 0x13u:
+    case 0x1Bu: {
+        const std::uint32_t e = g_dump_clut[clut_slot][raw & 255u];
+        return (cpsm == PSMCT32 || cpsm == PSMCT24) ? e : expand16_1x(e, w);
+    }
+    case 0x14u:
+    case 0x24u:
+    case 0x2Cu: {
+        const std::uint32_t e = g_dump_clut[clut_slot][((csa & 15u) * 16u + (raw & 15u)) & 511u];
+        return (cpsm == PSMCT32 || cpsm == PSMCT24) ? e : expand16_1x(e, w);
+    }
+    default:
+        return raw;
+    }
+}
+
 void check_tex_entry_stat(TexIndexEntry &e) {
     for (const TexCandidateFile &cf : e.files) {
 #if defined(_WIN32)
@@ -1689,9 +1969,15 @@ void check_tex_entry_stat(TexIndexEntry &e) {
     e.modified = false;
 }
 
-void note_tex_upload_key(std::uint32_t dbp, std::uint64_t key) {
-    g_dbp_tex_key[dbp & 0x3FFFu] = key;
-    if (!g_tex_overrides_enabled) return;
+void note_tex_size_in_index(std::uint32_t w, std::uint32_t h) {
+    for (std::uint32_t tw = 0; tw <= 10; ++tw)
+        if ((1u << tw) == w)
+            for (std::uint32_t th = 0; th <= 10; ++th)
+                if ((1u << th) == h) g_tex_size_in_index[tw][th] = true;
+}
+
+void track_tex_key(std::uint64_t key) {
+    if (!g_tex_overrides_enabled || !key || key == 1ull) return;
     auto it = g_tex_index.find(key);
     if (it == g_tex_index.end()) return;
     TexIndexEntry &e = it->second;
@@ -1700,6 +1986,11 @@ void note_tex_upload_key(std::uint32_t dbp, std::uint64_t key) {
         g_tracked_tex_keys.push_back(key);
         check_tex_entry_stat(e);
     }
+}
+
+void note_tex_upload_key(std::uint32_t dbp, std::uint64_t key) {
+    g_dbp_tex_key[dbp & 0x3FFFu] = key;
+    track_tex_key(key);
 }
 
 void poll_tex_overrides_frame() {
@@ -1727,22 +2018,53 @@ void load_tex_index_file(const std::filesystem::path &tsv_path) {
             e.orig_h = h;
             e.files.push_back({os::utf8(base_dir / os::path(rel_buf)), mtime_ns, fsize});
             if (e.active_path.empty()) e.active_path = e.files.back().png_path;
+            note_tex_size_in_index(w, h);
             ++count;
         }
     }
     if (count > 0) {
         g_tex_overrides_enabled = true;
+        if (g_state_vram_1x.size() < kMemorySize) g_state_vram_1x.assign(kMemorySize, 0);
+        if (g_dump_clut.size() < kClutSlots) g_dump_clut.assign(kClutSlots, {});
         std::fprintf(stderr, "[gpu] indexed %zu moddable textures from %s (live 1x/HD .png overrides active)\n", count, os::utf8(tsv_path).c_str());
     }
 }
 
 void init_tex_overrides() {
     g_tex_index.clear();
+    g_ident_tex_key.clear();
+    std::memset(g_tex_size_in_index, 0, sizeof g_tex_size_in_index);
     g_tracked_tex_keys.clear();
     g_override_used = 0;
     g_tex_overrides_enabled = false;
     g_tex_override_all = os::env("PS2_TEX_OVERRIDE_ALL") == "1";
     g_tex_hot_reload = os::env("PS2_TEX_HOT_RELOAD") == "1";
+    g_tex_dump_enabled = false;
+    g_tex_dump_dir.clear();
+    g_dumped_tex_keys.clear();
+
+    const std::string dump_opt = os::env("PS2_TEX_DUMP");
+    if (!dump_opt.empty() && dump_opt != "0") {
+        g_tex_dump_enabled = true;
+        g_tex_dump_dir = (dump_opt == "1") ? "tex_dump" : dump_opt;
+        std::error_code ec;
+        const std::filesystem::path dump_p = os::path(g_tex_dump_dir);
+        std::filesystem::create_directories(dump_p, ec);
+        g_state_vram_1x.assign(kMemorySize, 0);
+        g_dump_clut.assign(kClutSlots, {});
+        const std::filesystem::path dump_tsv = dump_p / "textures_index.tsv";
+        if (std::filesystem::is_regular_file(dump_tsv, ec)) {
+            std::ifstream tf(dump_tsv);
+            std::string line;
+            while (std::getline(tf, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                unsigned long long k = 0;
+                if (std::sscanf(line.c_str(), "%llx", &k) == 1 && k != 0) g_dumped_tex_keys.insert(static_cast<std::uint64_t>(k));
+            }
+        }
+        std::fprintf(stderr, "[gpu] texture dump enabled: writing drawn textures to %s (%zu already indexed)\n", os::utf8(dump_p).c_str(), g_dumped_tex_keys.size());
+    }
+
     std::string opt = os::env("PS2_TEX_OVERRIDES");
     const std::string opt_dir = os::env("PS2_TEX_OVERRIDE_DIR");
     if (!opt_dir.empty() && opt_dir != "0") opt = opt_dir;
@@ -1754,6 +2076,10 @@ void init_tex_overrides() {
         if (std::filesystem::is_directory(p, ec)) p /= "textures_index.tsv";
         if (std::filesystem::is_regular_file(p, ec)) {
             load_tex_index_file(p);
+            return;
+        }
+        if (g_tex_dump_enabled) {
+            g_tex_overrides_enabled = true;
             return;
         }
     }
@@ -1786,6 +2112,7 @@ void init_tex_overrides() {
         }
         if (g_tex_overrides_enabled) return;
     }
+    if (g_tex_dump_enabled) g_tex_overrides_enabled = true;
 }
 
 std::uint64_t recover_state_vram_tex_key(const std::uint32_t *w, std::uint32_t base_w, std::uint32_t base_h) {
@@ -1793,46 +2120,104 @@ std::uint64_t recover_state_vram_tex_key(const std::uint32_t *w, std::uint32_t b
     const std::uint32_t psm = w[14];
     const std::uint32_t *f = w + 25;
     const std::uint32_t pws = f[3] & 15u, phs = (f[3] >> 4) & 15u, nbit = (f[3] >> 10) & 1u;
-    const auto addr_of = [&](std::uint32_t x, std::uint32_t y, std::uint32_t &n_out) -> std::uint32_t {
-        const std::uint32_t n = g_swizzle[f[2] + ((y & ((1u << phs) - 1u)) << pws) + (x & ((1u << pws) - 1u))];
-        n_out = n;
-        return (f[0] + ((x >> pws) + (y >> phs) * f[1]) * 8192u + (n >> nbit)) & (kMemorySize - 1u);
-    };
-    std::vector<std::uint8_t> unswiz;
+    const std::uint32_t mask_x = (1u << pws) - 1u, mask_y = (1u << phs) - 1u;
+    const std::uint32_t f0 = f[0], f1 = f[1], f2 = f[2];
+    const std::uint8_t *vram = g_state_vram_1x.data();
+    const std::uint32_t *swz = g_swizzle.data();
+    static thread_local std::vector<std::uint8_t> unswiz;
     if (psm == PSMT8) {
         unswiz.resize(static_cast<std::size_t>(base_w) * base_h);
-        for (std::uint32_t y = 0; y < base_h; ++y)
-            for (std::uint32_t x = 0; x < base_w; ++x) {
-                std::uint32_t n = 0;
-                unswiz[y * base_w + x] = g_state_vram_1x[addr_of(x, y, n)];
+        for (std::uint32_t y = 0; y < base_h; ++y) {
+            const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+            const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+            std::uint8_t *dst = unswiz.data() + static_cast<std::size_t>(y) * base_w;
+            std::uint32_t x = 0;
+            for (; x + 4 <= base_w; x += 4) {
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                dst[x + 0] = vram[a + 0];
+                dst[x + 1] = vram[a + 4];
+                dst[x + 2] = vram[a + 16];
+                dst[x + 3] = vram[a + 20];
             }
-    } else if (psm == PSMT4) {
-        unswiz.assign((static_cast<std::size_t>(base_w) * base_h) / 2, 0);
-        for (std::uint32_t y = 0; y < base_h; ++y)
+            for (; x < base_w; ++x) {
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                dst[x] = vram[a];
+            }
+        }
+    } else if (psm == PSMT8H) {
+        unswiz.resize(static_cast<std::size_t>(base_w) * base_h);
+        for (std::uint32_t y = 0; y < base_h; ++y) {
+            const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+            const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+            std::uint8_t *dst = unswiz.data() + static_cast<std::size_t>(y) * base_w;
             for (std::uint32_t x = 0; x < base_w; ++x) {
-                std::uint32_t n = 0;
-                const std::uint8_t b = g_state_vram_1x[addr_of(x, y, n)];
-                const std::uint8_t nib = (n & 1u) ? (b >> 4) : (b & 0xFu);
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                dst[x] = vram[a + 3u];
+            }
+        }
+    } else if (psm == PSMT4 || psm == PSMT4HL || psm == PSMT4HH) {
+        unswiz.assign((static_cast<std::size_t>(base_w) * base_h) / 2, 0);
+        for (std::uint32_t y = 0; y < base_h; ++y) {
+            const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+            const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+            for (std::uint32_t x = 0; x < base_w; ++x) {
+                const std::uint32_t n = swz_row[x & mask_x];
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + (n >> nbit)) & (kMemorySize - 1u);
+                std::uint8_t nib = 0;
+                if (psm == PSMT4) {
+                    const std::uint8_t b = vram[a];
+                    nib = (n & 1u) ? (b >> 4) : (b & 0xFu);
+                } else {
+                    const std::uint8_t b = vram[(a & ~3u) + 3u];
+                    nib = (psm == PSMT4HH) ? (b >> 4) : (b & 0xFu);
+                }
                 const std::size_t idx = static_cast<std::size_t>(y) * base_w + x;
                 if (idx & 1u) unswiz[idx >> 1] |= static_cast<std::uint8_t>(nib << 4);
                 else unswiz[idx >> 1] = nib;
             }
+        }
     } else if (psm == PSMCT32) {
         unswiz.resize(static_cast<std::size_t>(base_w) * base_h * 4);
-        for (std::uint32_t y = 0; y < base_h; ++y)
-            for (std::uint32_t x = 0; x < base_w; ++x) {
-                std::uint32_t n = 0;
-                const std::uint32_t a = addr_of(x, y, n) & ~3u;
-                std::memcpy(&unswiz[(y * base_w + x) * 4], &g_state_vram_1x[a], 4);
+        for (std::uint32_t y = 0; y < base_h; ++y) {
+            const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+            const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+            std::uint8_t *dst = unswiz.data() + static_cast<std::size_t>(y) * base_w * 4;
+            std::uint32_t x = 0;
+            for (; x + 8 <= base_w; x += 8) {
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                std::memcpy(dst + x * 4 + 0, vram + a + 0, 8);
+                std::memcpy(dst + x * 4 + 8, vram + a + 16, 8);
+                std::memcpy(dst + x * 4 + 16, vram + a + 32, 8);
+                std::memcpy(dst + x * 4 + 24, vram + a + 48, 8);
             }
+            for (; x < base_w; ++x) {
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                std::memcpy(dst + x * 4, vram + a, 4);
+            }
+        }
+    } else if (psm == PSMCT24) {
+        unswiz.resize(static_cast<std::size_t>(base_w) * base_h * 4);
+        for (std::uint32_t y = 0; y < base_h; ++y) {
+            const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+            const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+            std::uint8_t *dst = unswiz.data() + static_cast<std::size_t>(y) * base_w * 4;
+            for (std::uint32_t x = 0; x < base_w; ++x) {
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                std::memcpy(dst + x * 4, vram + a, 4);
+                dst[x * 4 + 3] = 0x80u;
+            }
+        }
     } else if (psm == PSMCT16 || psm == PSMCT16S) {
         unswiz.resize(static_cast<std::size_t>(base_w) * base_h * 2);
-        for (std::uint32_t y = 0; y < base_h; ++y)
+        for (std::uint32_t y = 0; y < base_h; ++y) {
+            const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+            const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+            std::uint8_t *dst = unswiz.data() + static_cast<std::size_t>(y) * base_w * 2;
             for (std::uint32_t x = 0; x < base_w; ++x) {
-                std::uint32_t n = 0;
-                const std::uint32_t a = addr_of(x, y, n) & ~1u;
-                std::memcpy(&unswiz[(y * base_w + x) * 2], &g_state_vram_1x[a], 2);
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 2u);
+                std::memcpy(dst + x * 2, vram + a, 2);
             }
+        }
     } else {
         return 1ull;
     }
@@ -1840,19 +2225,328 @@ std::uint64_t recover_state_vram_tex_key(const std::uint32_t *w, std::uint32_t b
     return key ? key : 1ull;
 }
 
+void copy_upload_to_vram_1x(const Image &im, const std::uint8_t *bytes, std::size_t n, std::uint32_t pixels, std::uint32_t lead_bits) {
+    if (g_swizzle.empty() || !im.rrw || !pixels) return;
+    if (g_state_vram_1x.size() < kMemorySize) g_state_vram_1x.assign(kMemorySize, 0);
+    std::uint32_t f[5];
+    fmt_words(im.dpsm, im.dbp, im.dbw, f);
+    const std::uint32_t pws = f[3] & 15u, phs = (f[3] >> 4) & 15u;
+    const std::uint32_t mask_x = (1u << pws) - 1u, mask_y = (1u << phs) - 1u;
+    const std::uint32_t f0 = f[0], f1 = f[1], f2 = f[2];
+    std::uint8_t *vram = g_state_vram_1x.data();
+    const std::uint32_t *swz = g_swizzle.data();
+
+    if (lead_bits == 0) {
+        std::uint32_t k = 0;
+        std::uint32_t x_off = im.done % im.rrw;
+        std::uint32_t y = (im.dsay + im.done / im.rrw) & 0x7FFu;
+        if (im.dpsm == PSMCT32 || im.dpsm == PSMZ32) {
+            while (k < pixels) {
+                const std::uint32_t span = std::min(pixels - k, im.rrw - x_off);
+                const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+                const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+                const std::uint8_t *src = bytes + static_cast<std::size_t>(k) * 4;
+                std::uint32_t i = 0;
+                while (i < span && ((im.dsax + x_off + i) & 7u) != 0) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                    std::memcpy(vram + a, src + static_cast<std::size_t>(i) * 4, 4);
+                    ++i;
+                }
+                for (; i + 8 <= span; i += 8) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                    const std::uint8_t *s = src + static_cast<std::size_t>(i) * 4;
+                    std::memcpy(vram + a + 0, s + 0, 8);
+                    std::memcpy(vram + a + 16, s + 8, 8);
+                    std::memcpy(vram + a + 32, s + 16, 8);
+                    std::memcpy(vram + a + 48, s + 24, 8);
+                }
+                for (; i < span; ++i) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                    std::memcpy(vram + a, src + static_cast<std::size_t>(i) * 4, 4);
+                }
+                k += span;
+                x_off = 0;
+                y = (y + 1) & 0x7FFu;
+            }
+            return;
+        }
+        if (im.dpsm == PSMCT16 || im.dpsm == PSMCT16S || im.dpsm == PSMZ16 || im.dpsm == PSMZ16S) {
+            while (k < pixels) {
+                const std::uint32_t span = std::min(pixels - k, im.rrw - x_off);
+                const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+                const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+                const std::uint8_t *src = bytes + static_cast<std::size_t>(k) * 2;
+                std::uint32_t i = 0;
+                while (i < span && ((im.dsax + x_off + i) & 7u) != 0) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 2u);
+                    std::memcpy(vram + a, src + static_cast<std::size_t>(i) * 2, 2);
+                    ++i;
+                }
+                for (; i + 8 <= span; i += 8) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                    const std::uint8_t *s = src + static_cast<std::size_t>(i) * 2;
+                    std::memcpy(vram + a + 0, s + 0, 2);
+                    std::memcpy(vram + a + 4, s + 2, 2);
+                    std::memcpy(vram + a + 16, s + 4, 2);
+                    std::memcpy(vram + a + 20, s + 6, 2);
+                    std::memcpy(vram + a + 32, s + 8, 2);
+                    std::memcpy(vram + a + 36, s + 10, 2);
+                    std::memcpy(vram + a + 48, s + 12, 2);
+                    std::memcpy(vram + a + 52, s + 14, 2);
+                }
+                for (; i < span; ++i) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 2u);
+                    std::memcpy(vram + a, src + static_cast<std::size_t>(i) * 2, 2);
+                }
+                k += span;
+                x_off = 0;
+                y = (y + 1) & 0x7FFu;
+            }
+            return;
+        }
+        if (im.dpsm == PSMT8) {
+            while (k < pixels) {
+                const std::uint32_t span = std::min(pixels - k, im.rrw - x_off);
+                const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+                const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+                const std::uint8_t *src = bytes + k;
+                std::uint32_t i = 0;
+                while (i < span && ((im.dsax + x_off + i) & 3u) != 0) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                    vram[a] = src[i];
+                    ++i;
+                }
+                for (; i + 4 <= span; i += 4) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                    vram[a + 0] = src[i + 0];
+                    vram[a + 4] = src[i + 1];
+                    vram[a + 16] = src[i + 2];
+                    vram[a + 20] = src[i + 3];
+                }
+                for (; i < span; ++i) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                    vram[a] = src[i];
+                }
+                k += span;
+                x_off = 0;
+                y = (y + 1) & 0x7FFu;
+            }
+            return;
+        }
+        if (im.dpsm == PSMT8H) {
+            while (k < pixels) {
+                const std::uint32_t span = std::min(pixels - k, im.rrw - x_off);
+                const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+                const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+                const std::uint8_t *src = bytes + k;
+                for (std::uint32_t i = 0; i < span; ++i) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                    vram[a + 3u] = src[i];
+                }
+                k += span;
+                x_off = 0;
+                y = (y + 1) & 0x7FFu;
+            }
+            return;
+        }
+        if (im.dpsm == PSMT4) {
+            while (k < pixels) {
+                const std::uint32_t span = std::min(pixels - k, im.rrw - x_off);
+                const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+                const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+                for (std::uint32_t i = 0; i < span; ++i) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t sw = swz_row[x & mask_x];
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + (sw >> 1u)) & (kMemorySize - 1u);
+                    const std::uint32_t ki = k + i;
+                    const std::uint8_t src_b = bytes[ki >> 1u];
+                    const std::uint8_t nib = (ki & 1u) ? (src_b >> 4u) : (src_b & 0xFu);
+                    if (sw & 1u) vram[a] = static_cast<std::uint8_t>((vram[a] & 0x0Fu) | (nib << 4u));
+                    else vram[a] = static_cast<std::uint8_t>((vram[a] & 0xF0u) | nib);
+                }
+                k += span;
+                x_off = 0;
+                y = (y + 1) & 0x7FFu;
+            }
+            return;
+        }
+        if (im.dpsm == PSMCT24 || im.dpsm == PSMZ24) {
+            while (k < pixels) {
+                const std::uint32_t span = std::min(pixels - k, im.rrw - x_off);
+                const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+                const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+                const std::uint8_t *src = bytes + static_cast<std::size_t>(k) * 3;
+                for (std::uint32_t i = 0; i < span; ++i) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                    std::memcpy(vram + a, src + static_cast<std::size_t>(i) * 3, 3);
+                }
+                k += span;
+                x_off = 0;
+                y = (y + 1) & 0x7FFu;
+            }
+            return;
+        }
+    }
+
+    for (std::uint32_t k = 0; k < pixels; ++k) {
+        const std::uint32_t p = im.done + k;
+        const std::uint32_t x = (im.dsax + p % im.rrw) & 0x7FFu;
+        const std::uint32_t y = (im.dsay + p / im.rrw) & 0x7FFu;
+        const std::uint64_t bit = lead_bits + static_cast<std::uint64_t>(k) * im.bpp;
+        const std::size_t byte_idx = static_cast<std::size_t>(bit >> 3);
+        std::uint64_t raw64 = 0;
+        if (byte_idx < n) std::memcpy(&raw64, bytes + byte_idx, std::min<std::size_t>(8, n - byte_idx));
+        const std::uint32_t v = im.bpp == 32 ? static_cast<std::uint32_t>(raw64 >> (bit & 7u))
+                                             : static_cast<std::uint32_t>((raw64 >> (bit & 7u)) & ((1ull << im.bpp) - 1ull));
+        write_pixel_1x(f, x, y, v);
+    }
+}
+
+std::uint64_t lookup_drawn_tex_key(const std::uint32_t *w, std::uint32_t base_w, std::uint32_t base_h) {
+    const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+    std::uint64_t ident = 0;
+    if (g_dec_on && tw <= 10 && th <= 10) {
+        if (!texture_id(w, ident)) return 1ull;
+        auto it = g_ident_tex_key.find(ident);
+        if (it != g_ident_tex_key.end()) return it->second;
+    }
+    const std::uint32_t dbp = w[12] & 0x3FFFu;
+    std::uint64_t key = g_dbp_tex_key[dbp];
+    if (key && key != 1ull) {
+        auto it = g_tex_index.find(key);
+        if (it == g_tex_index.end() || it->second.orig_w != base_w || it->second.orig_h != base_h) key = 1ull;
+    }
+    if ((!key || key == 1ull) && !g_state_vram_1x.empty()) {
+        key = recover_state_vram_tex_key(w, base_w, base_h);
+        if (!ident) note_tex_upload_key(dbp, key);
+        else track_tex_key(key);
+    }
+    if (ident != 0) {
+        if (g_ident_tex_key.size() >= 16384) g_ident_tex_key.clear();
+        g_ident_tex_key[ident] = key ? key : 1ull;
+    }
+    return key;
+}
+
+std::uint64_t clut_tex_key(const std::uint32_t *w, std::uint64_t base_key) {
+    if (!base_key || base_key == 1ull) return base_key;
+    const std::uint32_t tpsm = w[14];
+    const bool eight = (tpsm == PSMT8 || tpsm == PSMT8H);
+    const bool four = (tpsm == PSMT4 || tpsm == PSMT4HL || tpsm == PSMT4HH);
+    if (!eight && !four) return base_key;
+    if (g_dump_clut.size() < kClutSlots) return base_key;
+    const std::uint32_t cpsm = w[16], csa = w[17], clut_slot = w[22] % kClutSlots;
+    const std::uint32_t count = eight ? 256u : 16u;
+    const std::uint32_t start = eight ? 0u : (csa & 15u) * 16u;
+    const std::uint32_t mask = (cpsm == PSMCT32) ? 0xFFFFFFFFu : (cpsm == PSMCT24) ? 0x00FFFFFFu : 0x0000FFFFu;
+    std::uint64_t h = 0xcbf29ce484222325ull;
+    const auto &slot = g_dump_clut[clut_slot];
+    for (std::uint32_t k = 0; k < count; ++k) {
+        const std::uint32_t e = slot[(start + k) & 511u] & mask;
+        h ^= e;
+        h *= 0x100000001b3ull;
+    }
+    const std::uint64_t combined = mix64(base_key, h);
+    return (combined && combined != 1ull) ? combined : base_key;
+}
+
+void dump_drawn_texture(const std::uint32_t *w, std::uint32_t base_w, std::uint32_t base_h) {
+    if (!g_tex_dump_enabled || g_state_vram_1x.size() < kMemorySize || g_swizzle.empty() || base_w > 1024 || base_h > 1024) return;
+    if (rendered(pages(w[12], w[13], w[14], 0, 0, static_cast<int>(base_w) - 1, static_cast<int>(base_h) - 1))) return;
+    const std::uint64_t base_key = lookup_drawn_tex_key(w, base_w, base_h);
+    const std::uint64_t key = clut_tex_key(w, base_key);
+    if (!key || key == 1ull) return;
+    if (!g_dumped_tex_keys.insert(key).second) return;
+
+    if (g_dump_clut.size() < kClutSlots) g_dump_clut.assign(kClutSlots, {});
+    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(base_w) * base_h * 4);
+    const std::uint32_t *tf = w + 25;
+    for (std::uint32_t y = 0; y < base_h; ++y) {
+        for (std::uint32_t x = 0; x < base_w; ++x) {
+            const std::uint32_t raw = read_pixel_1x(tf, x, y);
+            const std::uint32_t c = convert_texel_1x(w, raw);
+            const std::size_t idx = (static_cast<std::size_t>(y) * base_w + x) * 4;
+            rgba[idx + 0] = static_cast<std::uint8_t>(c & 0xFFu);
+            rgba[idx + 1] = static_cast<std::uint8_t>((c >> 8u) & 0xFFu);
+            rgba[idx + 2] = static_cast<std::uint8_t>((c >> 16u) & 0xFFu);
+            const std::uint32_t ps2_a = c >> 24u;
+            rgba[idx + 3] = (ps2_a >= 128u) ? 255u : static_cast<std::uint8_t>(ps2_a << 1u);
+        }
+    }
+
+    char fname[32] = {};
+    std::snprintf(fname, sizeof fname, "%016llx.png", static_cast<unsigned long long>(key));
+    const std::filesystem::path dump_dir = os::path(g_tex_dump_dir);
+    const std::filesystem::path png_path = dump_dir / fname;
+    const std::string png_utf8 = os::utf8(png_path);
+    if (!write_png_rgba(png_utf8, base_w, base_h, rgba.data())) return;
+
+#if defined(_WIN32)
+    struct _stat64 st = {};
+    if (::_wstat64(png_path.c_str(), &st) != 0) return;
+    const std::uint64_t mtime_ns = static_cast<std::uint64_t>(st.st_mtime) * 1000000000ULL;
+#elif defined(__linux__)
+    struct stat st = {};
+    if (::stat(png_utf8.c_str(), &st) != 0) return;
+    const std::uint64_t mtime_ns = static_cast<std::uint64_t>(st.st_mtim.tv_sec) * 1000000000ULL + static_cast<std::uint64_t>(st.st_mtim.tv_nsec);
+#else
+    struct stat st = {};
+    if (::stat(png_utf8.c_str(), &st) != 0) return;
+    const std::uint64_t mtime_ns = static_cast<std::uint64_t>(st.st_mtime) * 1000000000ULL;
+#endif
+    const auto fsize = static_cast<std::uint64_t>(st.st_size);
+
+    std::error_code ec;
+    const std::filesystem::path tsv_path = dump_dir / "textures_index.tsv";
+    const bool need_header = !std::filesystem::exists(tsv_path, ec);
+    if (std::FILE *f = os::open(os::utf8(tsv_path).c_str(), "ab")) {
+        if (need_header) std::fprintf(f, "# key_hex\twidth\theight\tmtime_ns\tsize_bytes\trel_path\n");
+        std::fprintf(f, "%016llx\t%u\t%u\t%llu\t%llu\t%s\n", static_cast<unsigned long long>(key), base_w, base_h,
+                     static_cast<unsigned long long>(mtime_ns), static_cast<unsigned long long>(fsize), fname);
+        std::fclose(f);
+    }
+
+    if (g_tex_overrides_enabled && g_tex_index.find(key) == g_tex_index.end()) {
+        TexIndexEntry &e = g_tex_index[key];
+        e.orig_w = base_w;
+        e.orig_h = base_h;
+        e.files.push_back({png_utf8, mtime_ns, fsize});
+        e.active_path = png_utf8;
+        e.tracked = true;
+        g_tracked_tex_keys.push_back(key);
+        note_tex_size_in_index(base_w, base_h);
+    }
+}
+
 // Called during plan_decodes: never calls stat(); reads only in-memory flags updated at upload time and every 120 frames at frame end.
 std::uint32_t resolve_tex_override(const std::uint32_t *w, std::uint32_t base_w, std::uint32_t base_h) {
     if (!g_tex_overrides_enabled) return 0xFFFFFFFFu;
-    const std::uint32_t dbp = w[12] & 0x3FFFu;
-    std::uint64_t key = g_dbp_tex_key[dbp];
-    if (!key && !g_state_vram_1x.empty()) {
-        key = recover_state_vram_tex_key(w, base_w, base_h);
-        note_tex_upload_key(dbp, key);
-    }
-    if (!key || key == 1ull) return 0xFFFFFFFFu;
-    auto it = g_tex_index.find(key);
+    const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+    if (tw > 10 || th > 10 || !g_tex_size_in_index[tw][th]) return 0xFFFFFFFFu;
+    if (rendered(pages(w[12], w[13], w[14], 0, 0, static_cast<int>(base_w) - 1, static_cast<int>(base_h) - 1))) return 0xFFFFFFFFu;
+    const std::uint64_t base_key = lookup_drawn_tex_key(w, base_w, base_h);
+    if (!base_key || base_key == 1ull) return 0xFFFFFFFFu;
+    const std::uint64_t pal_key = clut_tex_key(w, base_key);
+    auto it = g_tex_index.find(pal_key);
+    if (it == g_tex_index.end() && pal_key != base_key) it = g_tex_index.find(base_key);
     if (it == g_tex_index.end()) return 0xFFFFFFFFu;
     TexIndexEntry &e = it->second;
+    if (!e.tracked) {
+        e.tracked = true;
+        g_tracked_tex_keys.push_back(it->first);
+        check_tex_entry_stat(e);
+    }
     if (!e.modified || base_w != e.orig_w || base_h != e.orig_h) return 0xFFFFFFFFu;
     if (!e.dirty && e.cached_dec != 0xFFFFFFFFu) return e.cached_dec;
 
@@ -1900,13 +2594,37 @@ void plan_decodes(std::uint32_t prims) {
     g_assigned.clear();
     g_setup_taps.clear();
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
-    if (g_tex_overrides_enabled) {
+    const auto ensure_setup_taps = [&] {
+        if (g_setup_taps.empty()) {
+            g_setup_taps.assign(setups, 0.0);
+            for (std::uint32_t q = 0; q < prims; ++q) {
+                const std::uint32_t *rec = b.prims.data() + q * kPrimWords;
+                if (rec[0] < setups)
+                    g_setup_taps[rec[0]] += static_cast<double>((rec[3] & 0xFFFFu) - (rec[2] & 0xFFFFu) + 1) * static_cast<double>((rec[3] >> 16) - (rec[2] >> 16) + 1);
+            }
+        }
+    };
+    if (g_tex_dump_enabled || g_tex_overrides_enabled) {
         for (std::uint32_t i = 0; i < setups; ++i) {
             std::uint32_t *w = b.setups.data() + i * kSetupWords;
             if (!(w[0] & 2u)) continue;
             const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
-            const std::uint32_t ov = resolve_tex_override(w, 1u << tw, 1u << th);
-            if (ov != 0xFFFFFFFFu) w[24] = ov;
+            const std::uint32_t bw = 1u << tw, bh = 1u << th;
+            // Large dynamic text/glyph pages (such as Silent Hill 2's 512x512 message pages) are drawn with only a few pixels per setup:
+            // skip them for both dumping and overriding so text pages are not snapshotted or frozen when loading a dumped folder back.
+            bool skip_sparse_page = false;
+            if (bw * bh >= 262144u) {
+                ensure_setup_taps();
+                const double taps = g_setup_taps[i] * ((w[0] & 16384u) ? 4.0 : 1.0);
+                if (taps * 8.0 < static_cast<double>(bw * bh)) skip_sparse_page = true;
+            }
+            if (!skip_sparse_page) {
+                if (g_tex_dump_enabled) dump_drawn_texture(w, bw, bh);
+                if (g_tex_overrides_enabled) {
+                    const std::uint32_t ov = resolve_tex_override(w, bw, bh);
+                    if (ov != 0xFFFFFFFFu) w[24] = ov;
+                }
+            }
         }
     }
     if (!g_decode) return;
@@ -1940,14 +2658,7 @@ void plan_decodes(std::uint32_t prims) {
         // its 512 x 512 palette pages with a few pixels per set-up and many palettes, and decoded 6 to 8 million texels a frame for that.
         // The pixels are the shapes' boxes (more than they cover), four taps each when filtered, and decoding wins from an eighth of the texels on.
         const auto worth = [&] {
-            if (g_setup_taps.empty()) {
-                g_setup_taps.assign(setups, 0.0);
-                for (std::uint32_t q = 0; q < prims; ++q) {
-                    const std::uint32_t *rec = b.prims.data() + q * kPrimWords;
-                    if (rec[0] < setups)
-                        g_setup_taps[rec[0]] += static_cast<double>((rec[3] & 0xFFFFu) - (rec[2] & 0xFFFFu) + 1) * static_cast<double>((rec[3] >> 16) - (rec[2] >> 16) + 1);
-                }
-            }
+            ensure_setup_taps();
             const double taps = g_setup_taps[i] * ((w[0] & 16384u) ? 4.0 : 1.0) * g_scale * g_scale;
             return taps * 8.0 >= static_cast<double>(words);
         };
@@ -2018,12 +2729,16 @@ void plan_decodes(std::uint32_t prims) {
     }
 }
 
+// Copies the words of graphics memory that the batch's textures read and its pixels write, so that the textures read them as they were before the batch.
+// When every such texture lies over the frame in the same page layout (same base, width and page size, the way a draw that reads the picture it is
+// drawing over does), only the rectangle of pages those textures cover is copied, row by row (`run` words of every `stride`); else the one range
+// from the first to the last word that both touch (follows upstream 883d903).
 std::uint32_t mip_top_of(const std::uint32_t *mip);
 Range mip_range(const std::uint32_t *setup, const std::uint32_t *mip, std::uint32_t top);
 
-std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32_t &hi) {
+std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32_t &hi, std::uint32_t &stride, std::uint32_t &run) {
     Batch &b = g_batch;
-    lo = hi = 0;
+    lo = hi = stride = run = 0;
     if (g_batch_reads.empty()) return 0;
     const Range fb = pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);
     const Range z = pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
@@ -2031,6 +2746,13 @@ std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32
     bool any = false;
     for (const Range &t : g_batch_reads) any = any || written(t);
     if (!any) return 0;
+    std::uint32_t pw, ph;
+    page_size(b.fpsm, pw, ph);
+    const int per_row = static_cast<int>(std::max<std::uint32_t>(1, b.fbw * 64 / pw));
+    const int fx0 = std::max(b.minx, 0) / static_cast<int>(pw), fy0 = std::max(b.miny, 0) / static_cast<int>(ph);
+    const int fx1 = std::max(b.maxx, 0) / static_cast<int>(pw), fy1 = std::max(b.maxy, 0) / static_cast<int>(ph);
+    int px0 = 1 << 30, py0 = 1 << 30, px1 = -1, py1 = -1;
+    bool rect = fx1 < per_row;
     Range shared;
     for (std::uint32_t i = 0; i < prims; ++i) {
         const std::uint32_t *rec = b.prims.data() + i * kPrimWords;
@@ -2038,23 +2760,62 @@ std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32
         const std::uint32_t *mip = b.any_mip && (rec[0] + 1) * kMipWords <= b.mips.size() ? b.mips.data() + rec[0] * kMipWords : nullptr;
         const std::uint32_t top = mip ? mip_top_of(mip) : 0u;
         if (!(setup[0] & 2u) || (!top && reads_own_word(rec, setup))) continue;
-        const int tw = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1), th = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1);
-        const Range whole = region(setup[12], setup[13], setup[14], 0, 0, tw - 1, th - 1);
-        const bool listed = !top && (rec[1] & kKindMask) == 1 && region_repeat(setup) && g_exact.state == 1 && g_exact.reads_ok;  // the word sets know what such sprites read (exact_reads)
-        Range t = top ? whole : listed ? g_exact.reads : read_range(rec, setup, whole);
-        if (top) {  // a shape that reads mip levels: the whole of every level it can reach (mip_range)
+        int u0, v0, u1, v1;
+        if (top) {  // a shape that reads mip levels: the whole of every level it can reach (mip_range), never a rectangle of pages
+            u0 = v0 = 0;
+            u1 = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1) - 1;
+            v1 = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1) - 1;
+        } else {
+            read_rect(rec, setup, u0, v0, u1, v1);
+        }
+        const Range rectangle = region(setup[12], setup[13], setup[14], u0, v0, u1, v1);  // the whole texture when read_rect cannot say
+        const bool repeat = (rec[1] & kKindMask) == 1 && region_repeat(setup);
+        const bool listed = repeat && g_exact.state == 1 && g_exact.reads_ok;  // the word sets know what such sprites read (exact_reads)
+        Range t = top ? rectangle : listed ? g_exact.reads : repeat ? repeat_range(rec, setup, rectangle) : rectangle;
+        if (top) {
             const Range levels = mip_range(setup, mip, top);
             t.add(levels.lo, levels.hi);
         }
-        for (const Range *w : {&fb, b.zwrite ? &z : nullptr})
-            if (w && t.overlaps(w->lo, w->hi)) shared.add(std::max(t.lo, w->lo), std::min(t.hi, w->hi));
+        if (b.zwrite && t.overlaps(z.lo, z.hi)) {
+            shared.add(std::max(t.lo, z.lo), std::min(t.hi, z.hi));
+            rect = false;
+        }
+        if (!t.overlaps(fb.lo, fb.hi)) continue;
+        shared.add(std::max(t.lo, fb.lo), std::min(t.hi, fb.hi));
+        std::uint32_t tpw, tph;
+        page_size(setup[14], tpw, tph);
+        if (top || setup[12] != b.fbp || setup[13] != b.fbw || tpw != pw || tph != ph || repeat || u1 / static_cast<int>(pw) >= per_row) {
+            rect = false;
+            continue;
+        }
+        const int x0 = std::max(u0 / static_cast<int>(pw), fx0), y0 = std::max(v0 / static_cast<int>(ph), fy0);
+        const int x1 = std::min(u1 / static_cast<int>(pw), fx1), y1 = std::min(v1 / static_cast<int>(ph), fy1);
+        if (x0 > x1 || y0 > y1) continue;
+        px0 = std::min(px0, x0);
+        py0 = std::min(py0, y0);
+        px1 = std::max(px1, x1);
+        py1 = std::max(py1, y1);
     }
     if (shared.lo >= shared.hi) return 0;
+    if (rect && px1 >= 0) {
+        const std::uint64_t base = static_cast<std::uint64_t>(b.fbp) * 256 + (static_cast<std::uint64_t>(px0) + static_cast<std::uint64_t>(py0) * per_row) * 8192;
+        if (base + static_cast<std::uint64_t>(py1 - py0 + 1) * per_row * 8192 <= kMemorySize) {
+            lo = static_cast<std::uint32_t>(base / 4);
+            run = static_cast<std::uint32_t>(px1 - px0 + 1) * 2048u;
+            stride = static_cast<std::uint32_t>(per_row) * 2048u;
+            const std::uint32_t rows = static_cast<std::uint32_t>(py1 - py0 + 1);
+            hi = lo + (rows - 1) * stride + run;
+            const std::uint32_t words = rows * run * g_scale * g_scale;
+            dispatch_linear(kSnapshot, words, push_params({lo, words, stride, run}));
+            return words;
+        }
+    }
     lo = static_cast<std::uint32_t>(std::min<std::uint64_t>(shared.lo, kMemorySize) / 4);
     hi = static_cast<std::uint32_t>(std::min<std::uint64_t>(shared.hi, kMemorySize) / 4);
     if (hi <= lo) return 0;
+    stride = run = hi - lo;
     const std::uint32_t words = (hi - lo) * g_scale * g_scale;
-    dispatch_linear(kSnapshot, words, push_params({lo, words}));
+    dispatch_linear(kSnapshot, words, push_params({lo, words, stride, run}));
     return words;
 }
 
@@ -2121,6 +2882,11 @@ void reset_batch() {
     b.maxx = b.maxy = -1;
 }
 
+// Workgroups of the raster program for a batch's lists: one per tile, or one per strip (PS2_GPU_STRIPS, STRIPS in gs.wgsl).
+std::uint32_t raster_groups(const tiles::Lists &lists) {
+    return lists.strips ? lists.tiles * static_cast<std::uint32_t>(tiles::strips()) : g_split ? lists.tiles * (g_tile / 2) : lists.tiles;
+}
+
 // Puts the lists of a job the helper has finished into the arena and fills in the parameter record and the command that flush_batch left open for them.
 void place_tiles(tiles::Job *job) {
     const tiles::Lists &lists = job->result;
@@ -2134,10 +2900,12 @@ void place_tiles(tiles::Job *job) {
     std::array<std::uint32_t, kParamStride / 4> &record = g_param_records[job->param];
     record[0] = tile_offset;
     record[3] = lists.tiles;
-    record[4] = tile_offset + lists.tiles * 2 + 2;
+    record[4] = tile_offset + lists.table;
     Command &c = g_commands[job->command];
-    c.x = std::min(lists.tiles, 1024u);
-    c.y = (lists.tiles + 1023) / 1024;
+    const std::uint32_t groups = raster_groups(lists);
+    c.x = std::min(groups, 1024u);
+    c.y = (groups + 1023) / 1024;
+    c.strips = lists.strips || g_split;
     tiles::release(job);
 }
 
@@ -2198,10 +2966,10 @@ void flush_batch() {
         lists = tiles::build_now(b.prims.data(), prims, [](void *, std::size_t words) { return g_arena.grow(words); }, nullptr);
         if (tiles::logging()) tiles::note_lists(g_arena.data() + tile_offset, lists);
     }
-    const std::uint32_t list_offset = tile_offset + lists.tiles * 2 + 2;
-    std::uint32_t snapshot_lo, snapshot_hi;
-    const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi);
-    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, lists.tiles, list_offset, snapshot_lo, snapshot_hi, 1u, 0u, mip_offset});
+    const std::uint32_t list_offset = tile_offset + lists.table;
+    std::uint32_t snapshot_lo, snapshot_hi, snapshot_stride, snapshot_run;
+    const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi, snapshot_stride, snapshot_run);
+    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, lists.tiles, list_offset, snapshot_lo, snapshot_hi, snapshot_stride, snapshot_run, mip_offset});
     note_raster(prims, lists.tiles, lists.total, snapshot);
     if (stat::g_on) {
         stat::batch(prims, kWhyName[g_why]);
@@ -2214,7 +2982,8 @@ void flush_batch() {
         g_why = kWhyFlush;
     }
     if (g_bench.capturing && hw::enabled()) hw::capture_batch(static_cast<std::uint32_t>(g_bench.subs.size()), static_cast<std::uint32_t>(g_commands.size()), b.prims.data(), prims, b.setups.data(), static_cast<std::uint32_t>(b.setups.size() / kSetupWords));
-    g_commands.push_back({kRaster, std::min(lists.tiles, 1024u), (lists.tiles + 1023) / 1024, param, mip_offset != 0xFFFFFFFFu});
+    const std::uint32_t groups = raster_groups(lists);
+    g_commands.push_back({kRaster, std::min(groups, 1024u), (groups + 1023) / 1024, param, mip_offset != 0xFFFFFFFFu, lists.strips || g_split});
     {   // what the run reads and writes, for fuse_runs (a run with a snapshot or on the card path is never fused: see there)
         RunMeta m;
         m.written[0] = region(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);
@@ -2371,6 +3140,24 @@ void emit_pre_hwr() {
     g_pre.clear();
 }
 
+// Uploads in squares (on by default; PS2_GPU_UPLOAD_BLOCKS=0 turns it off): an upload command whose records allow it runs in 8 x 8 squares of the rectangle (upload in gs.wgsl). A record allows it when no two
+// of its pixels can land on the same place of graphics memory, so that the order in which they are written cannot matter: its rows stay inside the
+// 2048-pixel space without wrapping, it is no wider than its buffer (else a row runs into the next row of pages), and its pages are fewer than the 512
+// of the whole memory. The others keep one thread per pixel in arrival order.
+bool g_upload_blocks = false;
+bool upload_in_squares(const std::uint32_t *q) {
+    const std::uint32_t bw = q[1], psm = q[2], sax = q[3], say = q[4], rrw = q[5], done = q[6], pixels = q[7];
+    if (!rrw || !pixels || hw::enabled()) return false;
+    const std::uint32_t first = done / rrw, last = (done + pixels - 1) / rrw;
+    if (sax + rrw > 2048 || say + last > 2047) return false;
+    std::uint32_t pw, ph;
+    page_size(psm, pw, ph);
+    const std::uint32_t per_row = std::max<std::uint32_t>(1, bw * 64 / pw);
+    if ((sax + rrw - 1) / pw >= per_row) return false;
+    const std::uint32_t lo = sax / pw + (say + first) / ph * per_row, hi = (sax + rrw - 1) / pw + (say + last) / ph * per_row;
+    return hi - lo < 512;
+}
+
 void emit_pre() {
     if (hwr::g_on) {
         emit_pre_hwr();
@@ -2388,6 +3175,35 @@ void emit_pre() {
             ++j;
         }
         const std::uint32_t count = static_cast<std::uint32_t>(j - i);
+        if (!clut && g_upload_blocks) {  // the uploads in 8 x 8 squares (upload in gs.wgsl, prm(3) = 1), when every record allows it
+            bool fits = true;
+            for (std::size_t k = i; k < j && fits; ++k) fits = upload_in_squares(g_pre[k].rec);
+            if (fits) {
+                std::uint32_t *records = g_arena.grow(count * 16u);
+                const std::uint32_t offset = static_cast<std::uint32_t>(records - g_arena.data());
+                std::uint32_t squares = 0;
+                for (std::size_t k = i; k < j; ++k) {
+                    const std::uint32_t *q = g_pre[k].rec;
+                    std::uint32_t *r = records + (k - i) * 16;
+                    std::memcpy(r, q, 11 * 4);
+                    const std::uint32_t first = q[6] / q[5], last = (q[6] + q[7] - 1) / q[5];
+                    const std::uint32_t bx0 = q[3] / 8, bx1 = (q[3] + q[5] - 1) / 8, by0 = (q[4] + first) / 8, by1 = (q[4] + last) / 8;
+                    r[11] = squares;
+                    r[12] = bx0;
+                    r[13] = by0;
+                    r[14] = bx1 - bx0 + 1;
+                    r[15] = 0;
+                    squares += (bx1 - bx0 + 1) * (by1 - by0 + 1);
+                }
+                if (g_live) {
+                    hw::live_position(static_cast<std::uint32_t>(g_commands.size()));
+                    for (std::size_t k = i; k < j; ++k) hw::live_writer(g_pre[k].range.lo, g_pre[k].range.hi);
+                }
+                if (squares) g_commands.push_back({kUpload, std::min(squares, 1024u), (squares + 1023) / 1024, push_params({offset, count, squares, 1})});
+                i = j;
+                continue;
+            }
+        }
         std::uint32_t *records = g_arena.grow(count * 12u);
         const std::uint32_t offset = static_cast<std::uint32_t>(records - g_arena.data());
         std::uint32_t total = 0;
@@ -2463,7 +3279,7 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
         }
         if (cached) source = 0x80000000u;
         if (g_cache_seen.size() > 65536) g_cache_seen.clear();
-    } else if (g_tex_overrides_enabled && im.done == 0 && n >= 64) {
+    } else if ((g_tex_overrides_enabled || g_tex_dump_enabled) && im.done == 0 && n >= 64) {
         upload_key = content_key(bytes, n);
     }
     if (!source) offset = arena_append(bytes, n);
@@ -2479,13 +3295,17 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     op.image = im.id;
     const Range pal_range_of_upload = op.range;
     queue_pre(op);
-    if (g_tex_overrides_enabled) {
+    const bool upload_changed = g_dec_on ? id_upload(op.rec, source ? mix64(g_cache_uid, 0xCAC4Eull) : n < kCacheMinBytes ? bytes_id(bytes, n) : fresh_id()) : true;  // after queue_pre, as hwcache below
+    if (g_tex_overrides_enabled || g_tex_dump_enabled) {
         if (op.range.lo < op.range.hi) {
             const std::uint32_t b0 = static_cast<std::uint32_t>(op.range.lo >> 8) & 0x3FFFu;
             const std::uint32_t b1 = static_cast<std::uint32_t>((op.range.hi - 1) >> 8) & 0x3FFFu;
             for (std::uint32_t b = b0; b <= b1; ++b) g_dbp_tex_key[b] = 1ull;
         }
-        if (im.done == 0 && im.dsax == 0 && im.dsay == 0 && upload_key != 0) note_tex_upload_key(im.dbp, upload_key);
+        const bool single_whole = (im.done == 0 && pixels >= im.total && im.dsax == 0 && im.dsay == 0 && im.dpsm != PSMCT32 && im.dpsm != PSMZ32);
+        if (single_whole && upload_key != 0 && g_tex_index.find(upload_key) != g_tex_index.end())
+            note_tex_upload_key(im.dbp, upload_key);
+        if (upload_changed) copy_upload_to_vram_1x(im, bytes, n, pixels, lead_bits);
     }
     if (hwr::g_on) hwr::upload(op.rec, bytes, n);
     if (g_dec_on) id_upload(op.rec, source ? mix64(g_cache_uid, 0xCAC4Eull) : n < kCacheMinBytes ? bytes_id(bytes, n) : fresh_id());  // after queue_pre, as hwcache below
@@ -2786,7 +3606,8 @@ bool runs_commute(std::uint32_t ia, std::uint32_t ib) {
 constexpr int kFuseMax = 8;  // the parameter record holds 4 words for each run from word 16 on
 
 void fuse_runs() {
-    static const bool on = os::env("PS2_FUSE") != "0" && os::env("PS2_AB_BATCH") != "0";
+    // off since the merge with upstream's strip lists: gs.wgsl's raster entry no longer reads a dispatch of several runs
+    static const bool on = false;
     static const int limit = [] {
         const int n = std::atoi(os::env("PS2_FUSE_MAX").c_str());
         return n >= 2 && n <= kFuseMax ? n : kFuseMax;
@@ -2905,7 +3726,75 @@ void ensure_capacity() {
     if (changed || !g_group) rebuild_group();
 }
 
-void profile_submit() {
+// The picture onto the window's texture (defined after display_layout).
+void encode_present(WGPUCommandEncoder enc, WGPUTextureView view, const WGPUPassTimestampWrites *timestamps, WGPURenderPipeline pipeline = nullptr);
+
+// PS2_BLIT_CHECK: the present pass of g_blit and of g_blit_ref into two textures of the window's size, read back and compared byte by byte.
+// Runs after a profiled submit has finished, so the picture and present()'s parameters are the ones the window just got.
+void blit_check() {
+    const std::uint32_t w = g_surface_width, h = g_surface_height;
+    if (!g_blit_ref || !w || !h) return;
+    const std::uint32_t row = (w * 4 + 255) / 256 * 256;
+    WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    td.size = {w, h, 1};
+    td.format = g_surface_format;
+    td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc;
+    WGPUTexture tex[2] = {wgpuDeviceCreateTexture(g_device, &td), wgpuDeviceCreateTexture(g_device, &td)};
+    WGPUBuffer read = make_buffer(static_cast<std::uint64_t>(row) * h * 2, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    for (int i = 0; i < 2; ++i) {
+        WGPUTextureView v = wgpuTextureCreateView(tex[i], nullptr);
+        encode_present(enc, v, nullptr, i ? g_blit_ref : g_blit);
+        wgpuTextureViewRelease(v);
+        WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+        src.texture = tex[i];
+        WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+        dst.buffer = read;
+        dst.layout.offset = static_cast<std::uint64_t>(row) * h * i;
+        dst.layout.bytesPerRow = row;
+        dst.layout.rowsPerImage = h;
+        const WGPUExtent3D size = {w, h, 1};
+        wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &size);
+    }
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+    wgpuQueueSubmit(g_queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+    wgpuCommandEncoderRelease(enc);
+    bool done = false;
+    WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+    cb.mode = WGPUCallbackMode_AllowProcessEvents;
+    cb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void *flag, void *) { *static_cast<bool *>(flag) = true; };
+    cb.userdata1 = &done;
+    wgpuBufferMapAsync(read, WGPUMapMode_Read, 0, static_cast<std::uint64_t>(row) * h * 2, cb);
+    wait_until(done);
+    if (const auto *b = static_cast<const std::uint8_t *>(wgpuBufferGetConstMappedRange(read, 0, static_cast<std::size_t>(row) * h * 2))) {
+        std::uint64_t differ = 0, hash = 1469598103934665603ull;
+        int most = 0;
+        std::uint32_t fx = 0, fy = 0;
+        for (std::uint32_t y = 0; y < h; ++y) {
+            const std::uint8_t *a = b + static_cast<std::size_t>(row) * y, *r = a + static_cast<std::size_t>(row) * h;
+            for (std::uint32_t x = 0; x < w; ++x) {
+                bool d = false;
+                for (int k = 0; k < 4; ++k) {
+                    const int diff = std::abs(int(a[x * 4 + k]) - int(r[x * 4 + k]));
+                    if (diff) d = true, most = std::max(most, diff);
+                    hash = (hash ^ a[x * 4 + k]) * 1099511628211ull;
+                }
+                if (d && !differ++) fx = x, fy = y;
+            }
+        }
+        std::fprintf(stderr, "[blit-check] frame %llu: %llu of %u window pixels differ (largest %d, first at %u %u), picture hash %016llx, look %u\n",
+                     static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(differ), w * h, most, fx, fy,
+                     static_cast<unsigned long long>(hash), post::g_blit[7]);
+    }
+    wgpuBufferUnmap(read);
+    wgpuBufferRelease(read);
+    wgpuTextureRelease(tex[0]);
+    wgpuTextureRelease(tex[1]);
+}
+
+// PS2_GPU_PROFILE in a window also times the picture's render pass (blit and overlay), as a line "present" after the frame's commands.
+void profile_submit(WGPUTextureView present_view) {
     constexpr std::uint32_t kMax = 2048;
     if (!g_profile_queries) {
         WGPUQuerySetDescriptor qd = WGPU_QUERY_SET_DESCRIPTOR_INIT;
@@ -2922,6 +3811,7 @@ void profile_submit() {
     const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(g_commands.size(), kMax));
     for (std::uint32_t i = 0; i < g_commands.size(); ++i) {
         const Command &c = g_commands[i];
+        ++g_dispatches[c.pipeline];  // as submit() counts them: present() skips an unchanged picture by these counts
         WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
         writes.querySet = g_profile_queries;
         writes.beginningOfPassWriteIndex = i * 2;
@@ -2936,23 +3826,33 @@ void profile_submit() {
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
-    if (n) {
-        wgpuCommandEncoderResolveQuerySet(enc, g_profile_queries, 0, n * 2, g_profile_resolve, 0);
-        wgpuCommandEncoderCopyBufferToBuffer(enc, g_profile_resolve, 0, g_profile_read, 0, n * 16);
+    const std::uint32_t timed = n + (present_view && n < kMax ? 1u : 0u);
+    if (timed > n) {
+        WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+        writes.querySet = g_profile_queries;
+        writes.beginningOfPassWriteIndex = n * 2;
+        writes.endOfPassWriteIndex = n * 2 + 1;
+        encode_present(enc, present_view, &writes);
+    } else if (present_view) {
+        encode_present(enc, present_view, nullptr);
+    }
+    if (timed) {
+        wgpuCommandEncoderResolveQuerySet(enc, g_profile_queries, 0, timed * 2, g_profile_resolve, 0);
+        wgpuCommandEncoderCopyBufferToBuffer(enc, g_profile_resolve, 0, g_profile_read, 0, timed * 16);
     }
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
     wgpuQueueSubmit(g_queue, 1, &cmd);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
-    if (n) {
+    if (timed) {
         bool done = false;
         WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
         cb.mode = WGPUCallbackMode_AllowProcessEvents;
         cb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void *flag, void *) { *static_cast<bool *>(flag) = true; };
         cb.userdata1 = &done;
-        wgpuBufferMapAsync(g_profile_read, WGPUMapMode_Read, 0, n * 16, cb);
+        wgpuBufferMapAsync(g_profile_read, WGPUMapMode_Read, 0, timed * 16, cb);
         wait_until(done);
-        const auto *t = static_cast<const std::uint64_t *>(wgpuBufferGetConstMappedRange(g_profile_read, 0, n * 16));
+        const auto *t = static_cast<const std::uint64_t *>(wgpuBufferGetConstMappedRange(g_profile_read, 0, timed * 16));
         std::size_t info = 0;
         for (std::uint32_t i = 0; t && i < n; ++i) {
             while (info < g_command_info.size() && g_command_info[info].index < i) ++info;
@@ -2962,8 +3862,13 @@ void profile_submit() {
                 for (std::uint32_t v : g_command_info[info].values) std::fprintf(g_profile_out, " %u", v);
             std::fprintf(g_profile_out, "\n");
         }
+        if (t && timed > n)
+            std::fprintf(g_profile_out, "%llu %u present %llu %u %u %u %u %u %u\n", static_cast<unsigned long long>(frame_count()), n,
+                         static_cast<unsigned long long>(t[n * 2 + 1] > t[n * 2] ? t[n * 2 + 1] - t[n * 2] : 0), g_surface_width, g_surface_height, post::g_blit[0],
+                         post::g_blit[1], post::g_blit[4], post::g_blit[7]);  // window size, picture size, blend of two fields, look
         wgpuBufferUnmap(g_profile_read);
     }
+    if (present_view) blit_check();
     g_commands.clear();
     g_run_meta.clear();
     g_command_info.clear();
@@ -3017,6 +3922,38 @@ Layout display_layout(float sw, float sh) {
     l.out_h = l.h / l.scale[1];
     return l;
 }
+// The picture onto the window's texture: the blit (blit.wgsl, from the prepared field texture when there is one) and the overlay panel, one
+// render pass. With `pipeline` (PS2_BLIT_CHECK) that present pass instead of g_blit, and no overlay.
+void encode_present(WGPUCommandEncoder enc, WGPUTextureView view, const WGPUPassTimestampWrites *timestamps, WGPURenderPipeline pipeline) {
+    WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+    color.view = view;
+    color.loadOp = WGPULoadOp_Clear;
+    color.storeOp = WGPUStoreOp_Store;
+    color.clearValue = WGPUColor{0.0, 0.0, 0.0, 1.0};
+    WGPURenderPassDescriptor rd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+    rd.colorAttachmentCount = 1;
+    rd.colorAttachments = &color;
+    rd.timestampWrites = timestamps;
+    WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+    const Layout lay = display_layout(static_cast<float>(g_surface_width), static_cast<float>(g_surface_height));
+    wgpuRenderPassEncoderSetViewport(rp, lay.x, lay.y, lay.w, lay.h, 0.0f, 1.0f);
+    if (pipeline || hwr::g_sweep != 3) {
+        wgpuRenderPassEncoderSetPipeline(rp, pipeline ? pipeline : g_blit);
+        wgpuRenderPassEncoderSetBindGroup(rp, 0, g_prep.show ? g_prep.show : g_blit_group, 0, nullptr);
+        wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+    }
+    if (!pipeline && g_overlay.on && g_overlay.group && g_surface_width && g_surface_height) {
+        // the panel's own rectangle, cut to the window (a window made smaller than the panel shows its top left part)
+        const std::uint32_t ox = std::min(g_overlay.x, g_surface_width - 1), oy = std::min(g_overlay.y, g_surface_height - 1);
+        const std::uint32_t ow = std::min(g_overlay.width, g_surface_width - ox), oh = std::min(g_overlay.height, g_surface_height - oy);
+        wgpuRenderPassEncoderSetViewport(rp, static_cast<float>(ox), static_cast<float>(oy), static_cast<float>(ow), static_cast<float>(oh), 0.0f, 1.0f);
+        wgpuRenderPassEncoderSetPipeline(rp, g_overlay.pipeline);
+        wgpuRenderPassEncoderSetBindGroup(rp, 0, g_overlay.group, 0, nullptr);
+        wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+    }
+    wgpuRenderPassEncoderEnd(rp);
+    wgpuRenderPassEncoderRelease(rp);
+}
 std::uint32_t fbits(float f) { std::uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
 // Whether the submit thread can take this run's submits at all, and whether it takes everything of them (writes and the picture too).
@@ -3050,10 +3987,11 @@ void submit(WGPUTextureView present_view = nullptr, bool present_job = false) {
     fuse_runs();  // before place_shapes: the dispatches it makes keep the shape records' offset in more places, and it adds tables to the arena
     place_shapes();
     if (g_bench.capturing) bench_capture();
-    if (g_profile_out && !present_view && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
+    if (g_profile_out && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
         write_blit();
         write_cache_pending();
-        profile_submit();
+        post::g_presented_async = false;
+        profile_submit(present_view);
         return;
     }
     ensure_capacity();
@@ -3122,7 +4060,7 @@ void submit(WGPUTextureView present_view = nullptr, bool present_job = false) {
         pass = begin_pass();
     }
     Pipeline current = kPipelines;
-    bool current_mip = false;
+    bool current_mip = false, current_strips = false;  // a batch kept per strip runs another program (g_raster_strips)
     ++g_submits;
     ++g_total_passes;
     static const unsigned skip = [] {  // PS2_GPU_SKIP=raster,snapshot: leave these kinds of work out (the picture is wrong; only to see what they cost)
@@ -3148,11 +4086,12 @@ void submit(WGPUTextureView present_view = nullptr, bool present_job = false) {
         ++g_dispatches[c.pipeline];
         if ((skip & (1u << c.pipeline)) || hwr::g_sweep == 4) continue;
         if (prof_piece >= 0) hwr::prof_name(prof_piece, kEntryPoints[c.pipeline]);
-        if (c.pipeline != current || c.mip != current_mip) {
+        if (c.pipeline != current || c.mip != current_mip || c.strips != current_strips) {
             wt::Scope s(wt::kSetPipeline);
             wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
             current = c.pipeline;
             current_mip = c.mip;
+            current_strips = c.strips;
         }
         const std::uint32_t offset = c.param * kParamStride;
         {
@@ -3184,34 +4123,7 @@ void submit(WGPUTextureView present_view = nullptr, bool present_job = false) {
     }
     if (present_view) {
         wt::Scope s(wt::kRenderPass);
-        WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
-        color.view = present_view;
-        color.loadOp = WGPULoadOp_Clear;
-        color.storeOp = WGPUStoreOp_Store;
-        color.clearValue = WGPUColor{0.0, 0.0, 0.0, 1.0};
-        WGPURenderPassDescriptor rd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
-        rd.colorAttachmentCount = 1;
-        rd.colorAttachments = &color;
-        WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
-        const float w = static_cast<float>(g_surface_width), h = static_cast<float>(g_surface_height);
-        const Layout lay = display_layout(w, h);
-        wgpuRenderPassEncoderSetViewport(rp, lay.x, lay.y, lay.w, lay.h, 0.0f, 1.0f);
-        if (hwr::g_sweep != 3) {
-            wgpuRenderPassEncoderSetPipeline(rp, g_blit);
-            wgpuRenderPassEncoderSetBindGroup(rp, 0, g_prep.show ? g_prep.show : g_blit_group, 0, nullptr);
-            wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
-        }
-        if (g_overlay.on && g_overlay.group && g_surface_width && g_surface_height) {
-            // the panel's own rectangle, cut to the window (a window made smaller than the panel shows its top left part)
-            const std::uint32_t ox = std::min(g_overlay.x, g_surface_width - 1), oy = std::min(g_overlay.y, g_surface_height - 1);
-            const std::uint32_t ow = std::min(g_overlay.width, g_surface_width - ox), oh = std::min(g_overlay.height, g_surface_height - oy);
-            wgpuRenderPassEncoderSetViewport(rp, static_cast<float>(ox), static_cast<float>(oy), static_cast<float>(ow), static_cast<float>(oh), 0.0f, 1.0f);
-            wgpuRenderPassEncoderSetPipeline(rp, g_overlay.pipeline);
-            wgpuRenderPassEncoderSetBindGroup(rp, 0, g_overlay.group, 0, nullptr);
-            wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
-        }
-        wgpuRenderPassEncoderEnd(rp);
-        wgpuRenderPassEncoderRelease(rp);
+        encode_present(enc, present_view, nullptr);
     }
     if (async) {
         post::Job &j = post::slot();
@@ -3407,16 +4319,17 @@ double bench_time(const std::vector<BenchBuffers> &bufs, unsigned skip, unsigned
         for (std::size_t i = 0; i < g_bench.subs.size(); ++i) {
             WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
             Pipeline current = kPipelines;
-            bool current_mip = false;
+            bool current_mip = false, current_strips = false;
             for (std::size_t n = 0; n < g_bench.subs[i].commands.size(); ++n) {
                 const Command &c = g_bench.subs[i].commands[n];
                 if (skip & (1u << c.pipeline)) continue;
                 if (size_filter && size_filter <= 2 && c.pipeline == kRaster && ((c.x * c.y <= 8u) == (size_filter == 1))) continue;  // 1: leave out the small runs (8 tiles or fewer), 2: leave out the big ones
                 if (size_filter >= 3 && c.pipeline == kRaster && (g_bench_glow[i][n] != 0) == (size_filter == 3)) continue;  // 3: leave out the full-screen sprite passes (lane glow), 4: leave out all the others
-                if (c.pipeline != current || c.mip != current_mip) {
+                if (c.pipeline != current || c.mip != current_mip || c.strips != current_strips) {
                     wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
                     current = c.pipeline;
                     current_mip = c.mip;
+                    current_strips = c.strips;
                 }
                 const std::uint32_t offset = c.param * kParamStride;
                 wgpuComputePassEncoderSetBindGroup(pass, 0, bufs[i].group, 1, &offset);
@@ -4354,6 +5267,7 @@ static void hwr_submit() {
     emit_all();
     ++g_submit_site[0], submit();
 }
+static bool compile_pipelines();
 
 bool init(Mode m) {
     if (m == Mode::off) return false;
@@ -4457,12 +5371,25 @@ bool init(Mode m) {
         }
     }
     if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 4u);
+    ps2::set_video_scale(g_scale);
     // PS2_SHARP_2D: how upscaled 2D art (text, icons, menus) is filtered, see SHARP in gs.wgsl: 0 plain bilinear, 1 sharp (the
     // default), 2 sharpest
     if (const char *sharp = std::getenv("PS2_SHARP_2D")) g_sharp_2d = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(sharp)), 0u, 2u);
+    g_scale_edges = os::env("PS2_SCALE_EDGES") != "0";
     g_copy_words = (1u << 20) * g_scale * g_scale;
     if (const int tile = std::atoi(os::env("PS2_TILE").c_str()); tile == 4 || tile == 8 || tile == 16) g_tile = tile;
-    tiles::configure(static_cast<int>(g_scale), g_tile);
+    g_strips = os::env("PS2_GPU_STRIPS") == "1";
+    // PS2_GPU_STRIPS_RATIO: a batch gets lists per strip when they hold at most this many times the entries of its lists per tile (4 or more: always)
+    const std::string strip_ratio = os::env("PS2_GPU_STRIPS_RATIO");
+    g_strip_ratio = strip_ratio.empty() ? g_strip_ratio : std::atof(strip_ratio.c_str());
+    tiles::configure(static_cast<int>(g_scale), g_tile, g_strips, g_strip_ratio);
+    g_strips = tiles::strips() != 0;  // not with 16-pixel tiles
+    if (g_strips) std::fprintf(stderr, "[gpu] tile lists per strip of two rows (PS2_GPU_STRIPS=1)\n");
+    // Split tiles: forced by PS2_GPU_STRIPS=2, off with 0 or 1, and on by default on Intel graphics (measured faster there, not slower elsewhere in the tests)
+    const std::string strips_env = os::env("PS2_GPU_STRIPS");
+    const bool split_intel_default = strips_env.empty() && g_vendor_id == 0x8086;
+    g_split = (strips_env == "2" || split_intel_default) && (g_tile == 4 || g_tile == 8) && !hw::enabled();
+    g_split_why = split_intel_default ? "Intel default; PS2_GPU_STRIPS=0 turns it off" : "PS2_GPU_STRIPS=2";
     g_field_words = (1u << 19) * g_scale * g_scale;
     g_vram = make_buffer(static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
     std::vector<std::uint32_t> tables;
@@ -4514,6 +5441,24 @@ bool init(Mode m) {
     pld.bindGroupLayouts = &g_layout;
     g_pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
 
+    if (!compile_pipelines()) return false;
+    ensure_capacity();
+    if (hw::enabled() && !g_bench.configured && os::env("PS2_GPU_HW_LIVE") != "0") {  // PS2_GPU_HW=1 without the bench draws the running game's plain shapes on the card
+        hw::Context hc{g_device, g_queue, g_vram, g_tables, g_clut, g_scratch, g_cache, g_layout, {}, kUpload, kLoadClut, kRaster, kDecode, kSnapshot, g_scale, nullptr, bytes_of_vram(), kGsShader};
+        g_live = hw::live_init(hc);
+    }
+    if (hwr::requested() && !g_live) {  // PS2_RENDERER=hw: the hardware renderer draws (hwr.cpp), its targets at PS2_SCALE
+        const hwr::Context hc{g_device, g_queue, g_decoded, static_cast<std::uint64_t>(kCachedWords) + kDecodedWords, g_layout, &g_group, kParamStride, kGsShader, g_swizzle.data(),
+                              wgpuDeviceHasFeature(g_device, WGPUFeatureName_DualSourceBlending) != 0, hwr_position, hwr_decode, hwr_params, fmt_words, hwr_submit, g_scale,
+                              static_cast<float>(std::atof(os::env("PS2_HWR_SCALE").c_str())), g_gl, g_swizzle.size(), g_clut, g_vram};
+        if (!hwr::init(hc)) std::fprintf(stderr, "[hwr] the hardware renderer could not start, the exact renderer draws\n");
+    }
+    g_mode = m;
+    g_current_mode = m;
+    return true;
+}
+
+static bool compile_pipelines() {
     // PS2_GS_SHADER=<file>: use this WGSL text instead of the built-in one (shader experiments without a rebuild)
     std::string shader_text;
     if (const std::string path = os::env("PS2_GS_SHADER"); !path.empty()) {
@@ -4559,7 +5504,7 @@ bool init(Mode m) {
     if (trusted) std::fprintf(stderr, "[gpu] draw program without wgpu's run-time checks (%s)\n", trusted_why);
     WGPUShaderModule module = trusted ? wgpuDeviceCreateShaderModuleTrusted(g_device, &md, WGPUShaderRuntimeChecks_None) : wgpuDeviceCreateShaderModule(g_device, &md);
 #endif
-    // a shader loaded with PS2_GS_SHADER may lack the later constants; TILE, EXPLICIT_FMA, SHARP and HAS_MIP are listed only when it declares them
+    // a shader loaded with PS2_GS_SHADER may lack the later constants; TILE, EXPLICIT_FMA, SHARP, EDGE_CLAMP and HAS_MIP are listed only when it declares them
     const bool has_tile = shader_text.empty() || shader_text.find("override TILE") != std::string::npos;
     const bool has_fma = shader_text.empty() || shader_text.find("override EXPLICIT_FMA") != std::string::npos;
     const bool has_mip = shader_text.empty() || shader_text.find("override HAS_MIP") != std::string::npos;
@@ -4570,16 +5515,33 @@ bool init(Mode m) {
     static const bool fast_swizzle = os::env("PS2_FAST_SWIZZLE") != "0";  // PS2_FAST_SWIZZLE=0: bilinear 8- and 4-bit texels through the address tables (gs.wgsl, sample)
     const bool has_slim_taps = shader_text.empty() || shader_text.find("override SLIM_TAPS") != std::string::npos;
     static const bool slim_taps = os::env("PS2_SLIM_TAPS") != "0";  // PS2_SLIM_TAPS=0: the 32-bit bilinear read converts each texel with the whole convert() (gs.wgsl, tap32)
+    const bool has_edges = shader_text.empty() || shader_text.find("override EDGE_CLAMP") != std::string::npos;
+    const bool has_strips = shader_text.empty() || shader_text.find("override STRIPS") != std::string::npos;
+    const bool has_split = shader_text.empty() || shader_text.find("override SPLIT") != std::string::npos;
+    if (g_split && !has_split) {  // a shader from a file without SPLIT: whole tiles
+        std::fprintf(stderr, "[gpu] the shader has no SPLIT, so every tile is drawn by one workgroup\n");
+        g_split = false;
+    }
+    if (g_split) std::fprintf(stderr, "[gpu] split tiles: a workgroup per two rows, lists per tile (%s)\n", g_split_why);
+    g_upload_blocks = os::env("PS2_GPU_UPLOAD_BLOCKS") != "0" && (shader_text.empty() || shader_text.find("PS2_GPU_UPLOAD_BLOCKS") != std::string::npos);
+    if (g_upload_blocks) std::fprintf(stderr, "[gpu] uploads in 8 x 8 squares (PS2_GPU_UPLOAD_BLOCKS=0 turns it off)\n");
+    if (g_strips && !has_strips) {  // a shader from a file that cannot read lists per strip: back to lists per tile (no list is built yet)
+        std::fprintf(stderr, "[gpu] the shader has no STRIPS, so the tile lists are kept per tile\n");
+        g_strips = false;
+        tiles::configure(static_cast<int>(g_scale), g_tile, false);
+    }
     const int scale = static_cast<int>(g_scale), tile = g_tile;
     const std::uint32_t sharp = g_sharp_2d;
-    // `mip`: the draw program that reads mipmap levels (HAS_MIP in gs.wgsl); without it the program is the plain one
-    auto make_pipeline = [=](int entry, bool mip) {
+    const bool edges = g_scale_edges;
+    // `mip`: the draw program that reads mipmap levels (HAS_MIP in gs.wgsl); without it the program is the plain one. `strips`: the draw program for
+    // lists per strip (STRIPS in gs.wgsl, PS2_GPU_STRIPS)
+    auto make_pipeline = [=](int entry, bool mip, bool strips = false) {
         WGPUComputePipelineDescriptor cd = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
         cd.layout = g_pipeline_layout;
         cd.compute.module = module;
         cd.compute.entryPoint = view(kEntryPoints[entry]);
         // a shader loaded with PS2_GS_SHADER may lack the later constants; each is listed only when the shader declares it
-        WGPUConstantEntry constants[8];
+        WGPUConstantEntry constants[12];
         std::size_t count = 0;
         const auto set = [&](bool declared, const char *key, double value) {
             if (!declared) return;
@@ -4592,10 +5554,14 @@ bool init(Mode m) {
         set(has_tile, "TILE", static_cast<double>(tile));
         set(has_fma, "EXPLICIT_FMA", explicit_fma ? 1.0 : 0.0);
         set(has_sharp, "SHARP", static_cast<double>(sharp));
+        set(has_edges, "EDGE_CLAMP", edges ? 1.0 : 0.0);
         set(has_mip, "HAS_MIP", mip ? 1.0 : 0.0);
         set(has_wide, "WIDE_LOADS", wide_loads ? 1.0 : 0.0);
         set(has_fast_swizzle, "FAST_SWIZZLE", fast_swizzle ? 1.0 : 0.0);
         set(has_slim_taps, "SLIM_TAPS", slim_taps ? 1.0 : 0.0);
+        set(has_strips, "STRIPS", strips && !g_split ? 1.0 : 0.0);  // (the plain programs get false and TILE rows)
+        set(has_split, "SPLIT", strips && g_split ? 1.0 : 0.0);       // the strip programs of split tiles (PS2_GPU_STRIPS=2)
+        set(has_strips, "ROWS", strips ? 2.0 : static_cast<double>(tile));
         cd.compute.constantCount = count;
         cd.compute.constants = constants;
         return wgpuDeviceCreateComputePipeline(g_device, &cd);
@@ -4608,16 +5574,26 @@ bool init(Mode m) {
         delete g_raster_mip_thread;
         g_raster_mip_thread = nullptr;
     }
+    if (g_raster_mip) wgpuComputePipelineRelease(g_raster_mip);
+    if (g_raster_strips) wgpuComputePipelineRelease(g_raster_strips);
+    if (g_raster_strips_mip) wgpuComputePipelineRelease(g_raster_strips_mip);
+    for (int i = 0; i < kPipelines; ++i) {
+        if (g_pipelines[i]) wgpuComputePipelineRelease(g_pipelines[i]);
+        g_pipelines[i] = nullptr;
+    }
     g_raster_mip = nullptr;
+    g_raster_strips = g_raster_strips_mip = nullptr;
     g_raster_mip_ready.store(true, std::memory_order_release);  // nothing to wait for unless the thread below starts
     // the module is released by whoever finishes last: this function after the plain programs, the thread after its one
     auto users = std::make_shared<std::atomic<int>>(has_mip ? 2 : 1);
     const auto release_module = [users, module]() {
         if (users->fetch_sub(1) == 1) wgpuShaderModuleRelease(module);
     };
-    const auto build_mip = [make_pipeline, release_module]() {
+    const bool strips = g_strips || g_split;
+    const auto build_mip = [make_pipeline, release_module, strips]() {
         const auto start = std::chrono::steady_clock::now();
         g_raster_mip = make_pipeline(kRaster, true);
+        if (strips) g_raster_strips_mip = make_pipeline(kRaster, true, true);
         std::fprintf(stderr, "[gpu] mipmap draw program %s in %.0f ms\n", g_raster_mip ? "compiled" : "FAILED (levels are ignored)", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
         release_module();
     };
@@ -4633,6 +5609,7 @@ bool init(Mode m) {
         g_pipelines[i] = make_pipeline(i, false);
         if (!g_pipelines[i]) return false;
     }
+    if (strips && !(g_raster_strips = make_pipeline(kRaster, false, true))) return false;
     std::fprintf(stderr, "[gpu] %d shaders compiled in %.0f ms\n", kPipelines, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start).count());
 #ifdef __EMSCRIPTEN__
     if (has_mip) build_mip();  // the browser build has no threads
@@ -4640,19 +5617,6 @@ bool init(Mode m) {
     if (has_mip && g_gl) build_mip();
 #endif
     release_module();
-    ensure_capacity();
-    if (hw::enabled() && !g_bench.configured && os::env("PS2_GPU_HW_LIVE") != "0") {  // PS2_GPU_HW=1 without the bench draws the running game's plain shapes on the card
-        hw::Context hc{g_device, g_queue, g_vram, g_tables, g_clut, g_scratch, g_cache, g_layout, {}, kUpload, kLoadClut, kRaster, kDecode, kSnapshot, g_scale, nullptr, bytes_of_vram(), kGsShader};
-        g_live = hw::live_init(hc);
-    }
-    if (hwr::requested() && !g_live) {  // PS2_RENDERER=hw: the hardware renderer draws (hwr.cpp), its targets at PS2_SCALE
-        const hwr::Context hc{g_device, g_queue, g_decoded, static_cast<std::uint64_t>(kCachedWords) + kDecodedWords, g_layout, &g_group, kParamStride, kGsShader, g_swizzle.data(),
-                              wgpuDeviceHasFeature(g_device, WGPUFeatureName_DualSourceBlending) != 0, hwr_position, hwr_decode, hwr_params, fmt_words, hwr_submit, g_scale,
-                              static_cast<float>(std::atof(os::env("PS2_HWR_SCALE").c_str())), g_gl, g_swizzle.size(), g_clut, g_vram};
-        if (!hwr::init(hc)) std::fprintf(stderr, "[hwr] the hardware renderer could not start, the exact renderer draws\n");
-    }
-    g_mode = m;
-    g_current_mode = m;
     return true;
 }
 
@@ -5031,6 +5995,30 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
                    : region(cbp, 1, cpsm, 0, 0, 15, 15);
     queue_pre(op);
+    if ((g_tex_dump_enabled || g_tex_overrides_enabled) && !g_swizzle.empty() && g_state_vram_1x.size() >= kMemorySize) {
+        if (g_dump_clut.size() < kClutSlots) g_dump_clut.assign(kClutSlots, {});
+        g_dump_clut[next] = g_dump_clut[g_clut_slot];
+        std::uint32_t f[5];
+        fmt_words(cpsm, cbp, csm ? cbw : 1u, f);
+        const bool eight = rec[6] != 0;
+        const std::uint32_t csa = rec[5], start = csm ? (csa * 16u) & 511u : eight ? 0u : (csa & 15u) * 16u;
+        const std::uint32_t count = eight ? 256u : 16u;
+        for (std::uint32_t k = 0; k < count; ++k) {
+            std::uint32_t x = 0, y = 0;
+            if (csm) {
+                x = cou * 16u + k;
+                y = cov;
+            } else if (eight) {
+                const std::uint32_t j = (k & ~0x18u) | ((k & 0x08u) << 1u) | ((k & 0x10u) >> 1u);
+                x = j & 15u;
+                y = j >> 4u;
+            } else {
+                x = k & 7u;
+                y = k >> 3u;
+            }
+            g_dump_clut[next][(start + k) & 511u] = read_pixel_1x(f, x, y);
+        }
+    }
     if (g_dec_on) id_clut(op.rec);
     if (hwr::g_on) hwr::clut(cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, psm == PSMT8 || psm == PSMT8H, cbw, cou, cov);
     if (g_live) hw::pal_clut(g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, psm == PSMT8 || psm == PSMT8H);  // after queue_pre (a pending batch that overwrites the palette was flushed by it)
@@ -5230,6 +6218,72 @@ void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
     read_back(g_scratch, bytes, memory + offset, offset);
 }
 
+// The depth round trip: a copy of graphics memory taken where a depth download stands in the drawing order,
+// every sample of every pixel, put back when the same bytes come back by an upload, so the game need not wait for the download.
+namespace {
+struct TripCopy {
+    WGPUBuffer buffer = nullptr;
+    std::uint64_t capacity = 0;
+    std::uint32_t scale = 1;  // the internal scale it was taken at (the quick menu can change it between a save and a read)
+} g_trip[kTripSlots];
+
+void copy_buffer(WGPUBuffer from, std::uint64_t from_offset, WGPUBuffer to, std::uint64_t to_offset, std::uint64_t bytes) {
+    flush_all();
+    submit();
+    post::drain();
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    wgpuCommandEncoderCopyBufferToBuffer(enc, from, from_offset, to, to_offset, bytes);
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+    wgpuQueueSubmit(g_queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+    wgpuCommandEncoderRelease(enc);
+}
+}
+
+bool trip_supported() { return g_mode == Mode::primary && g_device && !g_live && !hwcache::g_on; }
+
+void trip_save(std::uint32_t slot, std::uint32_t offset, std::uint32_t bytes) {
+    TripCopy &t = g_trip[slot % kTripSlots];
+    const std::uint64_t size = static_cast<std::uint64_t>(bytes) * g_scale * g_scale;
+    if (t.capacity < size) {
+        if (t.buffer) wgpuBufferRelease(t.buffer);
+        t.buffer = make_buffer(size, WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
+        t.capacity = size;
+    }
+    t.scale = g_scale;
+    copy_buffer(g_vram, static_cast<std::uint64_t>(offset) * g_scale * g_scale, t.buffer, 0, size);
+}
+
+bool trip_restore(std::uint32_t slot, std::uint32_t offset, std::uint32_t bytes) {
+    TripCopy &t = g_trip[slot % kTripSlots];
+    Image &im = g_image;
+    const std::uint64_t size = static_cast<std::uint64_t>(bytes) * g_scale * g_scale;
+    if (!t.buffer || t.scale != g_scale || t.capacity < size || !im.active || im.done || im.lead_bits || !im.pending.empty()) return false;
+    im.active = false;  // the upload this stands for is done, all of it
+    copy_buffer(t.buffer, 0, g_vram, static_cast<std::uint64_t>(offset) * g_scale * g_scale, size);
+    // the caches as after a write: at 1x as after the upload (its samples are all one), scaled as after a local copy (they may differ)
+    const Range r{offset, static_cast<std::uint64_t>(offset) + bytes};
+    if (g_scale == 1)
+        for (std::uint64_t at = r.lo; at < r.hi; at += 8192) g_rendered[(at >> 13) & 511u] = false;
+    else mark_rendered(r);
+    if (g_dec_on) stamp_pages(r, g_scale != 1);
+    return true;
+}
+
+void trip_read(std::uint32_t slot, std::uint32_t bytes, std::uint8_t *out) {
+    TripCopy &t = g_trip[slot % kTripSlots];
+    const std::uint32_t samples = t.scale * t.scale;
+    std::vector<std::uint32_t> all(static_cast<std::size_t>(bytes / 4) * samples);
+    if (!t.buffer || t.capacity < all.size() * 4) {
+        std::memset(out, 0, bytes);
+        return;
+    }
+    flush_all();
+    submit();
+    read_back(t.buffer, all.size() * 4, all.data());
+    for (std::size_t w = 0; w < bytes / 4; ++w) std::memcpy(out + w * 4, &all[w * samples], 4);  // sample 0, as kResolve gives a download
+}
+
 void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vector<std::uint32_t> &clut) {
     if (hwr::g_on) hwr::sync_all();
     flush_all();
@@ -5244,18 +6298,24 @@ void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vec
 
 void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, const std::vector<std::uint32_t> &clut) {
     wait_idle();
+    ++g_picture_epoch;
     if (stat::g_on) stat::state_loaded();
     if (hwcache::g_on) hwcache::state_loaded();
     dec_reset();  // memory and palette are new: nothing kept is valid
     const std::size_t words = kMemorySize / 4;
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
-    if (g_tex_overrides_enabled && from > 0 && vram.size() >= words * from) {
+    if ((g_tex_overrides_enabled || g_tex_dump_enabled) && from > 0 && vram.size() >= words * from) {
         std::memset(g_dbp_tex_key, 0, sizeof g_dbp_tex_key);
+        g_ident_tex_key.clear();
         g_state_vram_1x.resize(kMemorySize);
         for (std::size_t w = 0; w < words; ++w) {
             const std::uint32_t word = vram[w * from];
             std::memcpy(&g_state_vram_1x[w * 4], &word, 4);
         }
+    }
+    if ((g_tex_dump_enabled || g_tex_overrides_enabled) && clut.size() >= kClutEntries) {
+        if (g_dump_clut.size() < kClutSlots) g_dump_clut.assign(kClutSlots, {});
+        std::memcpy(g_dump_clut[g_clut_slot].data(), clut.data(), kClutEntries * 4);
     }
     // A page counts as drawn by the GS when its samples differ within a texel; one that is the same in all of them was uploaded (or
     // is flat, which reads the same either way).
@@ -5306,6 +6366,7 @@ void stats() {
 
 void configure_surface() {
     post::drain();  // no present of the old swap chain may be in flight
+    ++g_picture_epoch;
     WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
     config.device = g_device;
     config.format = g_surface_format;
@@ -5463,6 +6524,14 @@ bool attach_surface(const SurfaceTarget &target) {
     for (const WGPUPresentMode wanted : {WGPUPresentMode_Immediate, WGPUPresentMode_Mailbox})
         for (std::size_t i = 0; i < caps.presentModeCount; ++i)
             if (caps.presentModes[i] == wanted) g_present_mode = wanted;
+    // With the speed limit off (PS2_NO_LIMIT, a measuring run) on Direct3D 12, Mailbox makes the window thread wait for the screen's refresh
+    // when our window is in front; Immediate does not. Normal play keeps Mailbox. PS2_PRESENT_MODE below still wins.
+    if (g_dx12_compiler) {
+        const std::string no_limit = os::env("PS2_NO_LIMIT");
+        if (!no_limit.empty() && no_limit != "0")
+            for (std::size_t i = 0; i < caps.presentModeCount; ++i)
+                if (caps.presentModes[i] == WGPUPresentMode_Immediate) g_present_mode = WGPUPresentMode_Immediate;
+    }
     // PS2_PRESENT_MODE=fifo, relaxed, mailbox or immediate asks for one mode (when the surface offers it); PS2_FRAME_LATENCY=1..8 sets how many
     // pictures the swap chain keeps in flight. Both are for experiments (docs/speed.md); the log line below says what is used.
     if (std::string want = os::env("PS2_PRESENT_MODE"); !want.empty()) {
@@ -5542,7 +6611,13 @@ struct PresentLog {
     bool on = report || ps2::hitch::on();  // PS2_HITCH_LOG times the steps of every picture too
     Clock::time_point since = Clock::now(), mark = since;
     double flush = 0, acquire = 0, submit = 0, present = 0;
-    std::uint32_t pictures = 0;
+    std::uint32_t pictures = 0, same = 0;  // `same`: pictures not presented because nothing changed (SamePicture)
+    void skipped(bool yes) {
+        if (yes) {
+            ++same;
+            picture();
+        }
+    }
     void lap(double &into) {
         const auto now = Clock::now();
         into += std::chrono::duration<double, std::milli>(now - mark).count();
@@ -5554,11 +6629,12 @@ struct PresentLog {
         const auto now = Clock::now();
         const double seconds = std::chrono::duration<double>(now - since).count();
         if (seconds < 1.0) return;
-        std::fprintf(stderr, "[present] %u pictures in %.2f s; per picture: flush %.2f ms, acquire %.2f ms, submit %.2f ms, present %.2f ms (%s)\n", pictures, seconds,
-                     flush / pictures, acquire / pictures, submit / pictures, present / pictures, present_mode_name(g_present_mode));
+        const double n = std::max<double>(pictures - same, 1.0);  // pictures that went to the screen
+        std::fprintf(stderr, "[present] %u pictures in %.2f s (%u not presented, nothing had changed); per picture presented: flush %.2f ms, acquire %.2f ms, submit %.2f ms, present %.2f ms (%s)\n", pictures, seconds, same,
+                     flush / n, acquire / n, submit / n, present / n, present_mode_name(g_present_mode));
         since = now;
         flush = acquire = submit = present = 0;
-        pictures = 0;
+        pictures = same = 0;
     }
 };
 
@@ -5768,14 +6844,99 @@ void present_job(Job &j) {
 }
 }  // namespace post
 }  // namespace
+std::uint32_t scale() { return g_scale; }
+
+// Upstream switches the inner resolution live (quick menu); this fork's present pass (prepared field textures) and the hardware renderer's
+// PS2_HWR_SCALE are set up for the scale of the start, so the resolution stays: a new PS2_SCALE takes effect at the next start.
+void set_scale(std::uint32_t new_scale) {
+    new_scale = std::clamp<std::uint32_t>(new_scale, 1u, 4u);
+    if (new_scale != g_scale) {
+        static bool told = false;
+        if (!told) std::fprintf(stderr, "[gpu] the resolution stays %ux until the next start\n", g_scale);
+        told = true;
+    }
+    ps2::set_video_scale(g_scale);
+}
+
+void apply_pending_scale() {
+    const std::uint32_t wanted = std::clamp<std::uint32_t>(ps2::video_scale(), 1u, 4u);
+    if (wanted != g_scale) set_scale(wanted);
+}
+
+// A picture the game has not changed since the last present (nothing drawn, uploaded or copied, the same read circuits, the same
+// window and picture look) is not handed to the screen again: the screen already shows it. PS2_PRESENT_SKIP=1 turns this on, 0 off.
+// At most kMaxSkipped in a row, so a window that lost its picture (a resize, a cover) gets one soon anyway.
+struct SamePicture {
+    bool valid = false;
+    std::uint32_t key[29] = {};
+    std::uint64_t work = 0;
+    unsigned skipped_in_row = 0;
+    std::uint64_t skipped = 0, shown = 0, checked = 0, mismatched = 0, looked = 0, hash = 0;
+};
+SamePicture g_same;
+constexpr unsigned kMaxSkipped = 30;
+constexpr bool kSkipSamePictures = true;  // on: charger runs in Best performance, 3 pairs each, were faster in front and never slower elsewhere; PS2_PRESENT_SKIP=0 turns it off
+
+std::uint64_t picture_work() {  // everything given to the chip that is not the display step itself
+    std::uint64_t total = g_commands.size();
+    for (int k = 0; k < kPipelines; ++k)
+        if (k != kDisplay) total += g_dispatches[k];
+    return total;
+}
+
+void picture_key(const DisplaySource &src, std::uint32_t (&key)[29]) {
+    const DisplayOverlay &o = src.overlay;
+    const std::uint32_t words[29] = {src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, o.active ? 1u : 0u, o.fbp, o.fbw, o.psm, o.dbx, o.dby,
+                                     static_cast<std::uint32_t>(o.x), static_cast<std::uint32_t>(o.y), o.width, o.height, g_surface_width, g_surface_height,
+                                     g_options.widescreen ? 1u : 0u, ps2::video_options(), g_scale, g_overlay.on ? 1u : 0u, g_overlay.x, g_overlay.y, g_overlay.width, g_overlay.height, g_picture_epoch};
+    std::memcpy(key, words, sizeof words);
+}
 
 bool present(const DisplaySource &src) {
     if (!g_surface) return false;
+    g_last_src = src;
+    apply_pending_scale();
     static PresentLog log;
     const double flush0 = log.flush, acquire0 = log.acquire, submit0 = log.submit, present0 = log.present;
     if (log.on) log.mark = PresentLog::Clock::now();
     flush_all();
     if (log.on) log.lap(log.flush);
+    static const std::string skip_asked = os::env("PS2_PRESENT_SKIP");
+    static const bool check_same = skip_asked == "check";  // PS2_PRESENT_SKIP=check: present every picture, but prove each "unchanged" call by reading the picture back
+    static const bool skip_same = check_same || (skip_asked.empty() ? kSkipSamePictures : skip_asked != "0");
+    if (skip_same && !g_live && !hwr::g_on) {
+        std::uint32_t key[29];
+        picture_key(src, key);
+        const std::uint64_t work = picture_work();
+        const bool same = g_same.valid && g_same.work == work && g_same.skipped_in_row < kMaxSkipped && std::memcmp(key, g_same.key, sizeof key) == 0;
+        if (check_same) {
+            std::vector<std::uint32_t> pixels;
+            std::uint32_t w = 0, h = 0;
+            display(src, pixels, w, h);
+            std::uint64_t hash = 1469598103934665603ull;
+            for (const std::uint32_t px : pixels) hash = (hash ^ px) * 1099511628211ull;
+            if (same) {
+                ++g_same.checked;
+                if (hash != g_same.hash) {
+                    if (g_same.mismatched++ < 20) std::fprintf(stderr, "[present-check] picture %llu was called unchanged but its pixels differ\n", static_cast<unsigned long long>(g_same.looked));
+                }
+            }
+            g_same.hash = hash;
+            if (++g_same.looked % 600 == 0)
+                std::fprintf(stderr, "[present-check] %llu pictures, %llu called unchanged, %llu of those differ\n", static_cast<unsigned long long>(g_same.looked), static_cast<unsigned long long>(g_same.checked), static_cast<unsigned long long>(g_same.mismatched));
+        } else if (same) {
+            ++g_same.skipped_in_row;
+            ++g_same.skipped;
+            log.skipped(true);
+            return true;
+        }
+        std::memcpy(g_same.key, key, sizeof key);
+        g_same.work = work;
+        g_same.valid = true;
+        g_same.skipped_in_row = 0;
+        ++g_same.shown;
+    }
+    log.skipped(false);
     const std::uint32_t current = field_base(g_field), previous = field_base(g_field + 1);
     static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
     const std::uint32_t param = display_params(src, current);
@@ -5844,6 +7005,7 @@ bool present(const DisplaySource &src) {
     if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
         if (st.texture) wgpuTextureRelease(st.texture);
         ++g_submit_site[8], submit();  // the chip still gets the work; only the screen misses this picture
+        g_same.valid = false;  // the screen does not show this picture: the next one is presented even if it looks the same
         if (reconfigure) configure_surface();
         return true;
     }
@@ -5974,6 +7136,7 @@ void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t h
     post::drain();
     if (!rgba || !width || !height || !g_surface) {
         g_overlay.on = false;
+        ++g_picture_epoch;
         return;
     }
     if (!g_overlay.pipeline && !make_overlay_pipeline()) return;
@@ -5996,6 +7159,7 @@ void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t h
         bd.entries = be;
         g_overlay.group = wgpuDeviceCreateBindGroup(g_device, &bd);
     }
+    ++g_picture_epoch;
     wgpuQueueWriteBuffer(g_queue, g_overlay.pixels, 0, rgba, bytes);
     const std::uint32_t rect[4] = {x, y, width, height};
     wgpuQueueWriteBuffer(g_queue, g_overlay.rect, 0, rect, sizeof rect);
@@ -6007,8 +7171,10 @@ void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t h
 }
 
 bool present_again() {
-    if (!g_surface || !g_have_previous) return false;
+    if (!g_surface) return false;
     post::drain();
+    apply_pending_scale();
+    if (!g_have_previous) return false;
     // the same picture as the last present (its fields are still in the scratch buffer: the game draws nothing while it waits), with the
     // window's size and the picture look of now
     const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
@@ -6049,6 +7215,8 @@ std::uint64_t g_copy_order = 0;
 
 bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
     post::drain();
+    g_last_src = src;
+    apply_pending_scale();
 #ifdef __EMSCRIPTEN__
     wgpuInstanceProcessEvents(g_instance);
 #else
@@ -6111,6 +7279,8 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
 }
 
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+    g_last_src = src;
+    apply_pending_scale();
     flush_all();
     const std::uint32_t param = display_params(src, 0);
     push_display(src, 0, param);

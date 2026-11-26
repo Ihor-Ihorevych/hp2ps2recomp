@@ -55,6 +55,8 @@ struct Unit {
     // Solid 3 clears them next to an OPMSUB before testing its collision
     // triangles). Follows upstream b7371e8.
     std::int32_t fsset = -1;
+    // where this run of the interpreter started: a read of Q is decided from the pairs it can reach (q_read_kind)
+    std::uint32_t start = 0;
 };
 
 Vu0Regs g_vu1;
@@ -63,18 +65,33 @@ std::uint32_t g_top = 0, g_itop = 0;
 std::uint32_t g_vu1_entry = 0;  // where the VU1 program that runs was started (entry())
 
 struct QDelay {
-    std::uint32_t generation = 0, value = 0;
+    std::uint32_t generation = 0, start = 0, value = 0;
 };
 
 QDelay g_q_kind[2][2048];
+
+// The pairs reachable from where the interpreter started, kept for the last start of each unit (the code memory as it is now).
+struct QReach {
+    std::uint32_t generation = 0, start = ~0u;
+    std::vector<std::uint32_t> pcs;
+};
+QReach g_q_reach[2];
 
 void read_q(const Unit &u, vuops::FlagPipe &pipe, Vu0Regs &r, std::uint32_t pc, std::uint32_t hi) {
     if (!pipe.q_pending || !reads_q(hi)) return;
     const int n = u.code == g_vu1_code ? 1 : 0;
     QDelay &d = g_q_kind[n][(pc & u.code_mask) >> 3];
-    if (d.generation != g_generation[n]) {
+    if (d.generation != g_generation[n] || d.start != u.start) {
+        QReach &reach = g_q_reach[n];
+        if (reach.generation != g_generation[n] || reach.start != u.start) {
+            reach.generation = g_generation[n];
+            reach.start = u.start;
+            reach.pcs = reachable(u.code, u.code_mask, u.start);
+        }
         d.generation = g_generation[n];
-        d.value = q_read_kind(u.code, u.code_mask, pc);
+        d.start = u.start;
+        // a pair the start cannot reach (after a jump through a register) is left to the cycle counter
+        d.value = q_read_kind(u.code, u.code_mask, reach.pcs, u.start, pc);
     }
     if (d.value == kQNew) pipe.flush_q(r);
     else if (d.value == kQDynamic) pipe.sync_q(r);
@@ -421,7 +438,7 @@ void scan_flags(int unit, const std::uint8_t *code, std::uint32_t size) {
         switch (lo >> 25) {
         case 0x14: case 0x15: case 0x16: case 0x17: case 0x18: case 0x1A: case 0x1B: used = clock = true; break;
         case 0x10: case 0x11: case 0x12: case 0x13: case 0x1C: clock = true; break;
-        case 0x40: clock = clock || waits_q(lo, hi) || q_unit_latency(lo, hi); break;
+        case 0x40: clock = clock || waits_q(lo, hi) || q_unit_latency(lo, hi) || waits_p(lo, hi) || p_unit_latency(lo, hi); break;
         default: break;
         }
     }
@@ -769,32 +786,37 @@ struct BranchView {
         std::uint16_t before[16] = {};
         std::uint8_t def = 0;
     };
-    Step hist[4] = {};
+    // A ring of four: at(0) is the instruction before the one about to run, at(3) the oldest. A new step takes the
+    // place of the oldest, so nothing is shifted per instruction.
+    Step ring[4] = {};
+    unsigned head = 0;
     std::uint16_t view[16] = {};
+    const Step &at(unsigned age) const { return ring[(head + age) & 3u]; }
 
     // Before an instruction runs: what its branch, if it is one, reads.
     void arm(Unit &u, const Vu0Regs &r) {
-        const unsigned reg = hist[0].def;
+        const unsigned reg = at(0).def;
         if (reg == 0 || (reg & 0x80u)) {
             u.branch_vi = nullptr;
             return;
         }
         unsigned j = 0;
         for (unsigned i = 0; i < 4; ++i) {
-            if (hist[i].def == reg) j = i;
+            if (at(i).def == reg) j = i;
             else break;
         }
         std::memcpy(view, r.vi, sizeof view);
-        view[reg] = hist[j].before[reg];
+        view[reg] = at(j).before[reg];
         u.branch_vi = view;
     }
     // Keep the registers as they are before this instruction for the next one.
     void snapshot(const Vu0Regs &r, std::uint16_t (&now)[16]) const { std::memcpy(now, r.vi, sizeof now); }
     void commit(const std::uint16_t (&was)[16], std::uint32_t lo, std::uint32_t hi) {
-        for (int i = 3; i > 0; --i) hist[i] = hist[i - 1];
-        std::memcpy(hist[0].before, was, sizeof hist[0].before);
+        head = (head - 1u) & 3u;
+        Step &s = ring[head];
+        std::memcpy(s.before, was, sizeof s.before);
         const unsigned reg = vi_written_reg(lo, hi);
-        hist[0].def = static_cast<std::uint8_t>(reg == 0 ? 0 : branch_delay_exempt(lo) ? (0x80u | reg) : reg);
+        s.def = static_cast<std::uint8_t>(reg == 0 ? 0 : branch_delay_exempt(lo) ? (0x80u | reg) : reg);
     }
 };
 
@@ -1941,6 +1963,7 @@ void run_fast(int n, std::uint32_t address) {
     vuops::FlagPipe pipe;
     pipe.start(r);
     u.pipe = &pipe;
+    u.start = address & u.code_mask;
     std::uint32_t vf_ready[32][4] = {}, vi_ready[16] = {};
     std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
     bool ending = false;
@@ -1972,7 +1995,8 @@ void run_fast(int n, std::uint32_t address) {
         pc = npc;
         npc = (npc + 8u) & u.code_mask;
         if (clock) {
-            pipe.t = issue_cycle(d.use, pipe.t + 1u, vf_ready, vi_ready, pipe.q_ready);
+            pipe.t = issue_cycle(d.use, pipe.t + 1u, vf_ready, vi_ready, pipe.q_ready, pipe.p_ready);
+            if (d.use.p_set) pipe.p_ready = pipe.t + d.use.p_set;
             retire(d.use, pipe.t, vf_ready, vi_ready);
         } else {
             ++pipe.t;
@@ -2084,6 +2108,7 @@ void run_reference(int n, std::uint32_t address) {
     vuops::FlagPipe pipe;
     pipe.start(r);
     u.pipe = &pipe;
+    u.start = address & u.code_mask;
     std::uint32_t vf_ready[32][4] = {}, vi_ready[16] = {};
     Decoded *cache = g_decoded[n];
     std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
@@ -2100,7 +2125,8 @@ void run_reference(int n, std::uint32_t address) {
         if (clock) {
             Decoded &d = cache[current >> 3];
             if (!d.valid || d.lo != lo || d.hi != hi) d = decode_upper(lo, hi);
-            pipe.t = issue_cycle(d.use, pipe.t + 1u, vf_ready, vi_ready, pipe.q_ready);
+            pipe.t = issue_cycle(d.use, pipe.t + 1u, vf_ready, vi_ready, pipe.q_ready, pipe.p_ready);
+            if (d.use.p_set) pipe.p_ready = pipe.t + d.use.p_set;
             retire(d.use, pipe.t, vf_ready, vi_ready);
         } else {
             ++pipe.t;

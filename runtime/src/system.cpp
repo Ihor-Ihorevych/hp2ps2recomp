@@ -138,6 +138,7 @@ std::string g_state_path;
 void (*g_state_complete)(bool, bool) = nullptr;
 
 std::atomic<std::uint32_t> g_video_options{0};
+std::atomic<std::uint32_t> g_video_scale{1};
 
 std::uint64_t next_event_time() {
     std::uint64_t t = UINT64_MAX;
@@ -316,6 +317,9 @@ void report_load() {
     last_frame = g_frames;
 }
 
+void path1_vblank_fence();
+void path1_vblank_hand_on();
+
 void vblank() {
     ++g_frames;
     crash::test_poll(crash::Thread::Game);
@@ -413,7 +417,9 @@ void vblank() {
     apply_patches(false);
     track_words();
     ee::live::frame_tick();   // code windows that settled are translated in the background, finished libraries come in here (docs/gvz.md)
+    path1_vblank_fence();
     if (g_options.on_vblank) g_options.on_vblank();
+    path1_vblank_hand_on();
     iop::sio2::flush_cards();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
     if (!g_options.frames_dir.empty() && frame_capture_requested(g_frames)) dump_frame();
@@ -429,6 +435,8 @@ void vblank() {
 }
 
 void idle(Cpu &c) {
+    // A game that waits for a SIGNAL or FINISH interrupt from PATH1 gets it here (gif.hpp): then its handler runs before the clock moves on
+    if (gif::path1_live() && gs::path1_may_interrupt() && gif::deliver_path1_live()) return;
     std::uint64_t next = next_event_time();
     if (next == UINT64_MAX && iop::idle()) {
         halt("deadlock: every thread waits and no event is pending");
@@ -520,6 +528,8 @@ std::uint32_t video_options() { return g_video_options.load(std::memory_order_re
 namespace { std::atomic<int> g_display_mode{0}; }
 void set_display_mode(int mode) { g_display_mode.store(mode < 0 || mode > 2 ? 0 : mode, std::memory_order_relaxed); }
 int display_mode() { return g_display_mode.load(std::memory_order_relaxed); }
+void set_video_scale(std::uint32_t scale) { g_video_scale.store(scale, std::memory_order_relaxed); }
+std::uint32_t video_scale() { return g_video_scale.load(std::memory_order_relaxed); }
 
 namespace {
 
@@ -533,13 +543,50 @@ std::function<void()> event_action(int id, std::uint64_t at) {
     return hw::event_action(id, at);
 }
 
-std::atomic<std::uint32_t> g_vu_fence{0};
+std::atomic<std::uint32_t> g_vu_fence{0};  // fences the vector thread has passed (counted here in its place without it)
+std::uint32_t g_fences_posted = 0;         // the emulation thread's: fences it has posted (or counted)
+
+void wait_vu_fence(std::uint32_t fence) {
+    for (std::uint32_t passed = g_vu_fence.load(); static_cast<std::int32_t>(passed - fence) < 0; passed = g_vu_fence.load())
+        gs::queue::wait(g_vu_fence, passed);
+}
+
+// A fence behind everything sent to the vector thread so far; returns its number. Without the thread VU1 runs here and has passed it
+// at once. The thread that runs VU1 counts it for PATH1 too (gif::path1_fence).
+std::uint32_t post_fence() {
+    const std::uint32_t fence = ++g_fences_posted;
+    if (gs::queue::vu_active()) {
+        gs::queue::vu().post(gs::queue::kVuFence, 0, 0, nullptr, 0);
+    } else {
+        gif::path1_fence();
+        g_vu_fence.store(fence);
+    }
+    return fence;
+}
 
 void sync_vu_thread() {
     if (!gs::queue::vu_active()) return;
-    const std::uint32_t seen = g_vu_fence.load();
-    gs::queue::vu().post(gs::queue::kVuFence, 0, 0, nullptr, 0);
-    while (g_vu_fence.load() == seen) gs::queue::wait(g_vu_fence, seen);
+    wait_vu_fence(post_fence());  // its own fence: the vblank's (below) may still be on the way
+}
+
+// PATH1's SIGNAL, FINISH and LABEL at a vblank (gif.hpp): a fence closes what was sent before it, and what the fence of two vblanks ago
+// closed is handed on. post_present (on_vblank) returns only once the drawing thread has shown all but the last two pictures, so the
+// vector thread, which hands the drawing thread its pictures, has passed the fence posted just before the picture of two vblanks ago: the
+// wait below only matters without a drawing thread to pace it (tests), where it costs nothing to speak of. The fence of the vblank before
+// is not that far yet: handing on what it closed waited for the vector thread at one vblank in six in Silent Hill 2.
+// [0] two vblanks ago, [1] the last vblank, [2] this one.
+std::uint32_t g_path1_fences[3] = {0, 0, 0};
+
+void path1_vblank_fence() {
+    g_path1_fences[0] = g_path1_fences[1];
+    g_path1_fences[1] = g_path1_fences[2];
+    g_path1_fences[2] = post_fence();
+}
+
+void path1_vblank_hand_on() {
+    if (!g_path1_fences[0]) return;
+    wait_vu_fence(g_path1_fences[0]);
+    gif::deliver_path1_before(g_path1_fences[0]);
 }
 
 void machine_state(state::Stream &s) {
@@ -549,6 +596,9 @@ void machine_state(state::Stream &s) {
     std::uint32_t version = kStateVersion;
     s.pod(version);
     if (std::memcmp(magic, kStateMagic, sizeof magic) != 0) throw std::runtime_error("not a state file");
+    // A state has no room for PATH1 SIGNAL, FINISH and LABEL writes not yet handed on (gif.hpp): a save hands them on first, before anything
+    // is written, and a load forgets those of the run it leaves (after the vector thread below has finished its old work).
+    if (!s.loading()) gif::save_path1();
     // Our version 4 differs from upstream's 4 (Cpu and thread layouts); 5 adds upstream's waiting HLE RPC replies; 6 adds the disc stream
     // of the IOP (sceCdSt*, where it is and whether it runs), so a state saved while a film or a music stream plays goes on streaming;
     // 7 adds the SIF RPC endpoints kept per server (guest servers, their order) and the IOP-to-EE request packet ring (SIF RPC rework, PR #27);
@@ -577,6 +627,10 @@ void machine_state(state::Stream &s) {
     hw::state(s);
     dmac::state(s);
     sync_vu_thread();
+    if (s.loading()) {
+        gif::forget_path1();
+        g_path1_fences[0] = g_path1_fences[1] = g_path1_fences[2] = 0;
+    }
     vif::state(s);
     vu::state(s);
     ipu::state(s);
@@ -997,6 +1051,9 @@ void run_vu_thread() {
     // (present, download, state, reset, ...) at once with what came before it. The order of the messages stays as it was.
     gs::queue::Ring &out = gs::queue::render();
     static const int batch = [] { const std::string v = os::env("PS2_HANDOVER_BATCH"); return v.empty() ? 2 : std::atoi(v.c_str()); }();
+    // PATH3 textures and VIF1 DIRECT data go on to the drawing thread as a pointer into this thread's own queue instead of a copy;
+    // PS2_HANDOVER_LEND=0 copies them as before.
+    if (os::env("PS2_HANDOVER_LEND") != "0") in.lend_into(out);
     for (;;) {
         gs::queue::Header h;
         const std::uint8_t *payload = nullptr;
@@ -1016,6 +1073,7 @@ void run_vu_thread() {
             case gs::queue::kPath3Idle: gif::vif1_idle(); break;
             case gs::queue::kGifReset:
                 gif::drop_held();
+                gif::reset_path1_scan();
                 gs::queue::render().post(gs::queue::kGifReset, h.arg0, h.arg1, payload, h.bytes);
                 break;
             case gs::queue::kVuReset:
@@ -1023,6 +1081,7 @@ void run_vu_thread() {
                 vu::reset();
                 break;
             case gs::queue::kVuFence:
+                gif::path1_fence();
                 g_vu_fence.fetch_add(1);
                 gs::queue::notify(g_vu_fence);
                 break;

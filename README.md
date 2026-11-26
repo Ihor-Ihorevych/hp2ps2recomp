@@ -44,7 +44,7 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 46
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 58
 other games play as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
@@ -126,7 +126,7 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Gundam vs. Zeta Gundam | plays, not played through yet: menus at full speed, a fight at 45 to 55 fps, a short pause the first time a new part loads ([#2](https://github.com/exoteric33/ps2-native-recomp/issues/2)) | omegakatana92, me |
 | Kidou Senshi Gundam: Ichinen Sensou (Japan) | plays, not played through yet: from power-on through the logos, the opening film and the title into the first mission; it needs a memory card in slot 1 ([#61](https://github.com/exoteric33/ps2-native-recomp/issues/61)) | omegakatana92, me |
 | Tales of the Abyss (USA) | plays, not played through yet: the opening films, the title and exploration at about 30 fps like the PS2, menus at 60 fps; battles not tried; at 2x resolution a dashed line shows along the bottom of the picture (SteamOS on a ROG Ally X, a DualShock 3; [#59](https://github.com/exoteric33/ps2-native-recomp/issues/59)) | Kush Peshin |
-| Final Fantasy X International (Japan) | runs, not played through yet: on this project's code from power-on through the opening film into Zanarkand (the first fight not reached yet); a tester reached Besaid Village in their own copy with three fixes of their own, and the one for long folder paths on Windows is now in the project (Windows 11, an RTX 4070 Ti Super, an Xbox controller) | a tester, by mail; me |
+| Final Fantasy X International (Japan) | plays well, not played through yet: a tester is a third of the way in (Djose Temple) with few problems; on this project's code from power-on through the opening film into Zanarkand (Windows 11, an RTX 4070 Ti Super, an Xbox controller) | LazyPeasant, me |
 | Digimon World Data Squad | plays, not played through yet: the opening film, menus, gameplay and a battle look and sound right; about 80 % of full speed on a very weak PC (Windows, Intel N100, 4 GB, 1x resolution, an Xbox 360 controller; Vulkan is as fast as Direct3D 12 there) | mizushucku |
 | Football Kingdom | plays, not played through yet: no crashes; the crowd sometimes goes black for a moment and the free kick aiming arrow is half as wide as it should be | a tester, by mail |
 | College Basketball 2K5 | plays, not played through yet: no glitches except one small sound stutter | a tester, by mail |
@@ -153,6 +153,10 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Champions of Norrath (USA) | runs, not played through yet: into the game and playing; heavy slowdown in places with many torches and fire effects ([#57](https://github.com/exoteric33/ps2-native-recomp/issues/57)) | davidsdullea |
 | Red Faction (USA) | plays well, not played through yet: about 3 hours (a third of the game) at full speed (about 30 fps) with a game controller; no problems found ([#107](https://github.com/exoteric33/ps2-native-recomp/issues/107)) | m3tabolic |
 | Half-Life (USA) | runs, not played through yet: menus and maps at full speed; the missing sound in the maps is fixed since the update of 2026-11-14 ([#105](https://github.com/exoteric33/ps2-native-recomp/issues/105)) | ChuckBurry200 |
+| Wacky Races: Starring Dastardly & Muttley (Europe) | plays well: played from start to end at full speed with a game controller, and at 60 Hz the picture fits the window without being cropped; at 50 Hz the picture shakes, so 60 Hz is the way to play it (Linux, a Radeon RX 6900 XT; [#129](https://github.com/exoteric33/ps2-native-recomp/issues/129)) | Roblox90864 |
+| Resident Evil Code: Veronica X (USA) | plays well, not played through yet: the first areas at 60 fps with a game controller; it slowed down with several zombies until *Make it faster*; thin lines around text and in the inventory at 2x and above, which PCSX2 shows too ([#135](https://github.com/exoteric33/ps2-native-recomp/issues/135)) | ultra-magic-peta |
+| Mortal Kombat: Deception (USA) | plays well, not played through yet: the Konquest story mode with Shujinko at 60 fps, no problems found (Windows 10, an RTX 5050, keyboard and mouse; [#138](https://github.com/exoteric33/ps2-native-recomp/issues/138)) | udiorusfm-tech |
+| Mortal Kombat: Armageddon (USA) | plays well, not played through yet: fights, Konquest and Motor Kombat, "runs perfectly fine" ([#26](https://github.com/exoteric33/ps2-native-recomp/issues/26)) | nahshongraham97 |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 
@@ -500,3 +504,15 @@ timestamp measurements. The frame identifies when the log is emitted, which may
 be ahead of the rendering thread. Only reads with a measured wait/encoding
 interval of at least 10 ms are reported: the first 20, then every 100th slow read
 across both paths. With the variable unset, no readback timers or lines are added.
+
+### Texture dumping and overrides
+
+Set `PS2_TEX_DUMP=<folder>` (or `PS2_TEX_DUMP=1` for `tex_dump/`) to write each texture the first time it is drawn as `<key>.png` alongside a `textures_index.tsv` manifest:
+
+```sh
+PS2_TEX_DUMP=tex_dump ./ps2run game.elf --window
+PS2_TEX_OVERRIDES=tex_dump ./ps2run game.elf --window
+```
+
+Set `PS2_TEX_OVERRIDES=<folder>` (or `PS2_TEX_OVERRIDE_DIR=<folder>`) to load modified `.png` files from that folder at 1x, 2x, 4x, or 8x resolution. Only files whose size or modification time differs from the `textures_index.tsv` baseline are loaded; set `PS2_TEX_HOT_RELOAD=1` to poll tracked files every 120 frames while the game runs. Screen copies and dynamic text pages are runtime snapshots that should not be edited.
+

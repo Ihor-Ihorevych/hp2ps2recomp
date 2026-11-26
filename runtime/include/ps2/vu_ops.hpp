@@ -156,12 +156,35 @@ inline bool waits_q(std::uint32_t lo, std::uint32_t hi) {
     return !(hi & 0x80000000u) && lower_major(lo) == 0x40 && (lo & 0x3Fu) == 0x3Fu && ((lo >> 6) & 31u) == 0x0Eu;
 }
 
+// The elementary function unit (VU1's EFU) is a pipeline like the divider: its result reaches P that many cycles after
+// the instruction, and a WAITP or the next EFU instruction waits for it (PCSX2's microVU: the latency less one cycle).
+// The instructions that read Q next to such a wait therefore issue late enough to see a divide that was started just
+// before (Digital Devil Saga: ADDq | WAITP right after SQRT and ESQRT sizes the status icons above the enemies).
+inline std::uint32_t p_unit_latency(std::uint32_t lo, std::uint32_t hi) {
+    if ((hi & 0x80000000u) || lower_major(lo) != 0x40 || (lo & 0x3Cu) != 0x3Cu) return 0;
+    switch (((lo >> 6) & 31u) * 4u + (lo & 3u)) {
+    case 0x70: return 11;                        // ESADD
+    case 0x71: case 0x72: case 0x79: return 18;  // ERSADD, ELENG, ERSQRT
+    case 0x73: return 24;                        // ERLENG
+    case 0x74: case 0x75: case 0x7D: return 54;  // EATANxy, EATANxz, EATAN
+    case 0x76: case 0x78: case 0x7A: return 12;  // ESUM, ESQRT, ERCPR
+    case 0x7C: return 29;                        // ESIN
+    case 0x7E: return 44;                        // EEXP
+    default: return 0;
+    }
+}
+
+inline bool waits_p(std::uint32_t lo, std::uint32_t hi) {
+    return !(hi & 0x80000000u) && lower_major(lo) == 0x40 && (lo & 0x3Fu) == 0x3Fu && ((lo >> 6) & 31u) == 0x1Eu;
+}
+
 // What an instruction pair reads and writes that the pipeline can still be busy with: the vector lanes it needs and the ones
 // it writes (register * 4 + lane), the integer registers it reads and the one an ILW loads, and the divide unit (a WAITQ or
-// a new divide waits for the quotient of the last one, q_set is the latency of the divide it starts).
+// a new divide waits for the quotient of the last one, q_set is the latency of the divide it starts), and the same for
+// the EFU (a WAITP or a new EFU instruction waits for P, p_set: the cycles until it may, see p_unit_latency).
 struct VfUse {
     std::uint8_t lanes_read[16] = {}, lanes_written[8] = {};
-    std::uint8_t nr = 0, nw = 0, vi_load = 0, q_wait = 0, q_set = 0;
+    std::uint8_t nr = 0, nw = 0, vi_load = 0, q_wait = 0, q_set = 0, p_wait = 0, p_set = 0;
     std::uint16_t vi_reads = 0;
     void read_vi(unsigned r) { vi_reads = static_cast<std::uint16_t>(vi_reads | ((1u << (r & 15u)) & ~1u)); }
     void read(unsigned r, unsigned m) {
@@ -250,6 +273,8 @@ inline VfUse vf_use(std::uint32_t lo, std::uint32_t hi) {
     }
     u.q_set = static_cast<std::uint8_t>(q_unit_latency(lo, hi));
     u.q_wait = u.q_set || waits_q(lo, hi);
+    if (const std::uint32_t p = p_unit_latency(lo, hi)) u.p_set = static_cast<std::uint8_t>(p - 1u);
+    u.p_wait = u.p_set || waits_p(lo, hi);
     return u;
 }
 
@@ -267,10 +292,13 @@ inline void retire(const VfUse &u, std::uint32_t cycle, std::uint32_t (&ready)[3
 }
 
 // The cycle an instruction pair issues at when it may not before `cycle`. The interpreters count these cycles in
-// FlagPipe::t: the pair waits for the registers it reads (and a WAITQ or divide for the last quotient, q_ready), so a
-// result that was four cycles away when it was written can be read by the third instruction after it, or by the first.
-inline std::uint32_t issue_cycle(const VfUse &u, std::uint32_t cycle, const std::uint32_t (&ready)[32][4], const std::uint32_t (&vi_ready)[16], std::uint32_t q_ready) {
+// FlagPipe::t: the pair waits for the registers it reads (and a WAITQ or divide for the last quotient, q_ready, a WAITP or
+// EFU instruction for the last EFU result, p_ready), so a result that was four cycles away when it was written can be read
+// by the third instruction after it, or by the first.
+inline std::uint32_t issue_cycle(const VfUse &u, std::uint32_t cycle, const std::uint32_t (&ready)[32][4], const std::uint32_t (&vi_ready)[16], std::uint32_t q_ready,
+                                 std::uint32_t p_ready = 0) {
     cycle = issue(u, cycle, ready, vi_ready);
+    if (u.p_wait) cycle = std::max(cycle, p_ready);
     return u.q_wait ? std::max(cycle, q_ready) : cycle;
 }
 
@@ -279,7 +307,7 @@ inline std::uint32_t issue_cycle(const VfUse &u, std::uint32_t cycle, const std:
 // integer registers 128 to 143, the quotient 144); the stall is the longest of those minus the cycle the instruction gets
 // anyway. Where two paths reach an instruction with different states and the stalls differ, the compiled program keeps the
 // index of the state it is in (`tracked`).
-constexpr unsigned kPipeVi = 128, kPipeQ = 144, kPipeSize = 145;
+constexpr unsigned kPipeVi = 128, kPipeQ = 144, kPipeP = 145, kPipeSize = 146;
 using PipeState = std::array<std::uint8_t, kPipeSize>;
 
 inline unsigned pipe_stall(const PipeState &s, const VfUse &u) {
@@ -287,6 +315,7 @@ inline unsigned pipe_stall(const PipeState &s, const VfUse &u) {
     for (unsigned i = 0; i < u.nr; ++i) wait = std::max<unsigned>(wait, s[u.lanes_read[i]]);
     for (unsigned m = u.vi_reads; m; m &= m - 1u) wait = std::max<unsigned>(wait, s[kPipeVi + static_cast<unsigned>(__builtin_ctz(m))]);
     if (u.q_wait) wait = std::max<unsigned>(wait, s[kPipeQ]);
+    if (u.p_wait) wait = std::max<unsigned>(wait, s[kPipeP]);
     return wait ? wait - 1u : 0u;
 }
 
@@ -296,6 +325,7 @@ inline PipeState pipe_step(const PipeState &s, const VfUse &u, unsigned stall) {
     for (unsigned i = 0; i < u.nw; ++i) o[u.lanes_written[i]] = 4;
     if (u.vi_load) o[kPipeVi + u.vi_load] = 4;
     if (u.q_set) o[kPipeQ] = u.q_set;
+    if (u.p_set) o[kPipeP] = u.p_set;
     return o;
 }
 
@@ -395,13 +425,14 @@ inline StallPlan stall_plan(const std::uint8_t *code, std::uint32_t mask, const 
         }
     };
     std::vector<Need> reads(slots), near1(slots), near2(slots);
-    std::vector<std::uint8_t> q_distance(slots, 255);
+    std::vector<std::uint8_t> q_distance(slots, 255), p_distance(slots, 255);
     for (std::uint32_t pc : pcs) {
         const std::size_t at = pc >> 3;
         const VfUse &u = use[at];
         for (unsigned i = 0; i < u.nr; ++i) reads[at].set(u.lanes_read[i]);
         for (unsigned m = u.vi_reads; m; m &= m - 1u) reads[at].set(kPipeVi + static_cast<unsigned>(__builtin_ctz(m)));
         if (u.q_wait) q_distance[at] = 0;
+        if (u.p_wait) p_distance[at] = 0;
     }
     for (int round = 0; round < 2; ++round) {
         std::vector<Need> &from = round ? near1 : reads, &to = round ? near2 : near1;
@@ -417,10 +448,18 @@ inline StallPlan stall_plan(const std::uint8_t *code, std::uint32_t mask, const 
             const Next s = successors(pc);
             for (unsigned k = 0; k < s.size(); ++k) q_distance[pc >> 3] = static_cast<std::uint8_t>(std::min<unsigned>(q_distance[pc >> 3], q_distance[s.at(k) >> 3] + 1u));
         }
+    for (int round = 0; round < 54; ++round)
+        for (std::uint32_t pc : pcs) {
+            const Next s = successors(pc);
+            for (unsigned k = 0; k < s.size(); ++k) p_distance[pc >> 3] = static_cast<std::uint8_t>(std::min<unsigned>(p_distance[pc >> 3], p_distance[s.at(k) >> 3] + 1u));
+        }
     const auto canonical = [&](PipeState s, std::uint32_t pc) {
         for (unsigned i = 0; i < kPipeQ; ++i)
             if (!near2[pc >> 3].test(i)) s[i] = 0;
         if (q_distance[pc >> 3] > 11) s[kPipeQ] = 0;
+        // P loses at least one per instruction, so a count no larger than the distance to the next WAITP or EFU instruction plus one
+        // cannot make anything wait: dropping it keeps paths that differ only there in one state.
+        if (p_distance[pc >> 3] > 52 || s[kPipeP] <= p_distance[pc >> 3] + 1u) s[kPipeP] = 0;
         return s;
     };
     std::vector<std::vector<PipeState>> states(slots);
@@ -494,52 +533,102 @@ inline bool reads_q(std::uint32_t hi) {
 
 enum QRead : std::uint8_t { kQDynamic, kQNew, kQOld };
 
-inline QRead q_read_kind(const std::uint8_t *code, std::uint32_t mask, std::uint32_t pc) {
+// Whether the instruction at `pc` that reads Q sees the quotient of the divide before it (kQNew), the one from before that divide (kQOld), or
+// it depends on the path (kQDynamic: the cycle counter decides). It looks only at the pairs of the program, `pcs` (reachable from `entry`):
+// a compiled VU1 program is found by its key over those pairs (program_key_moved), so code it never runs must not change what it computes
+// (an EFU instruction just before the entry made a later WAITP look long enough for the new quotient). It walks the paths back
+// from the read to the divide, takes up to three pairs before the divide as the pipeline it starts in (along the same paths; the program
+// starts with every unit idle), and works out on each whether the divide is done when the read issues. A path that reaches the entry
+// without a divide has none in flight (each run starts with no quotient pending) and counts for neither side.
+inline QRead q_read_kind(const std::uint8_t *code, std::uint32_t mask, const std::vector<std::uint32_t> &pcs, std::uint32_t entry, std::uint32_t pc) {
     const auto load = [&](std::uint32_t a, std::uint32_t &lo, std::uint32_t &hi) {
         std::memcpy(&lo, code + (a & mask), 4);
         std::memcpy(&hi, code + (a & mask) + 4, 4);
     };
+    pc &= mask;
+    entry &= mask;
+    std::vector<std::uint8_t> in((mask + 1u) / 8u, 0), direct((mask + 1u) / 8u, 0);
+    for (std::uint32_t a : pcs) in[(a & mask) >> 3] = 1;
+    if (!in[pc >> 3]) return kQDynamic;
     {
         std::uint32_t lo, hi;
         load(pc, lo, hi);
         if (waits_q(lo, hi) || q_unit_latency(lo, hi)) return kQNew;
     }
+    // the branches of the program: target -> its delay slot, which goes on there
     std::vector<std::pair<std::uint32_t, std::uint32_t>> jumps;
-    for (std::uint32_t a = 0; a <= mask; a += 8) {
+    direct[entry >> 3] = 1;
+    for (std::uint32_t a : pcs) {
         std::uint32_t lo, hi;
         load(a, lo, hi);
-        if (!(hi & 0x80000000u) && is_branch(lo) && !is_jump_register(lo)) jumps.emplace_back(branch_target(lo, a, mask), (a + 8u) & mask);
+        if (!(hi & 0x80000000u) && is_branch(lo) && !is_jump_register(lo)) {
+            const std::uint32_t target = branch_target(lo, a, mask);
+            direct[target >> 3] = 1;
+            if (in[((a + 8u) & mask) >> 3] && in[target >> 3]) jumps.emplace_back(target, (a + 8u) & mask);
+        }
     }
+    // What runs just before `y` (the inverse of stall_plan's successors): the pair before it, unless that one is the delay slot of a jump or
+    // of the end and not itself a place the program can come to directly; and the delay slot of every branch to `y`.
     const auto preds = [&](std::uint32_t y) {
         std::vector<std::uint32_t> out;
-        std::uint32_t lo, hi;
-        load(y - 16u, lo, hi);
-        const bool jumped = !(hi & 0x80000000u) && is_branch(lo) && (is_unconditional(lo) || is_jump_register(lo));
-        if (!jumped && !(hi & 0x40000000u)) out.push_back((y - 8u) & mask);
+        const std::uint32_t x = (y - 8u) & mask, b = (y - 16u) & mask;
+        if (in[x >> 3]) {
+            bool continues = true;
+            if (in[b >> 3]) {
+                std::uint32_t lo, hi;
+                load(b, lo, hi);
+                const bool lower_op = !(hi & 0x80000000u);
+                if ((hi & 0x40000000u) || (lower_op && is_jump_register(lo))) continues = false;
+                else if (lower_op && is_branch(lo)) continues = !is_unconditional(lo);
+            }
+            if (continues || direct[x >> 3]) out.push_back(x);
+        }
         for (const auto &[target, slot] : jumps)
-            if (target == (y & mask)) out.push_back(slot);
+            if (target == y && std::find(out.begin(), out.end(), slot) == out.end()) out.push_back(slot);
         return out;
     };
-    const auto complete = [&](const std::vector<std::uint32_t> &back, std::uint32_t latency) {
-        std::vector<std::uint32_t> order;
-        const std::uint32_t div = back.back();
-        for (std::uint32_t k = 3; k > 0; --k) order.push_back((div - 8u * k) & mask);
+    // the pairs that may run in the three cycles before the divide at `div`, oldest first; shorter where the program starts
+    const auto contexts = [&](std::uint32_t div) {
+        std::vector<std::vector<std::uint32_t>> out;
+        std::vector<std::vector<std::uint32_t>> stack{{div}};
+        while (!stack.empty() && out.size() < 64) {
+            const std::vector<std::uint32_t> chain = std::move(stack.back());
+            stack.pop_back();
+            const std::vector<std::uint32_t> from = preds(chain.back());
+            if (chain.size() == 4 || from.empty() || chain.back() == entry) {
+                std::vector<std::uint32_t> c(chain.rbegin(), chain.rend() - 1);
+                out.push_back(std::move(c));
+                if (chain.size() == 4 || from.empty()) continue;
+            }
+            for (std::uint32_t p : from) {
+                std::vector<std::uint32_t> next = chain;
+                next.push_back(p);
+                stack.push_back(std::move(next));
+            }
+        }
+        return out;
+    };
+    // on one path (read ... divide, backwards) and one start: is the divide done when the read issues?
+    const auto complete = [&](const std::vector<std::uint32_t> &context, const std::vector<std::uint32_t> &back, std::uint32_t latency) {
+        std::vector<std::uint32_t> order = context;
         order.insert(order.end(), back.rbegin(), back.rend());
         std::uint32_t ready[32][4] = {}, vi_ready[16] = {};
-        std::uint32_t cycle = 0, issued = 0;
+        std::uint32_t cycle = 0, issued = 0, p_ready = 0;
         for (std::size_t i = 0; i < order.size(); ++i) {
             std::uint32_t lo, hi;
             load(order[i], lo, hi);
             const VfUse u = vf_use(lo, hi);
             cycle = issue(u, cycle + 1u, ready, vi_ready);
-            if (i == 3) issued = cycle;
+            if (u.p_wait) cycle = std::max(cycle, p_ready);
+            if (u.p_set) p_ready = cycle + u.p_set;
+            if (i == context.size()) issued = cycle;
             retire(u, cycle, ready, vi_ready);
         }
         return cycle >= issued + latency;
     };
     bool any_new = false, any_old = false;
     unsigned budget = 4096;
-    std::vector<std::vector<std::uint32_t>> stack{{pc & mask}};
+    std::vector<std::vector<std::uint32_t>> stack{{pc}};
     while (!stack.empty()) {
         if (!--budget) return kQDynamic;
         const std::vector<std::uint32_t> path = std::move(stack.back());
@@ -549,7 +638,8 @@ inline QRead q_read_kind(const std::uint8_t *code, std::uint32_t mask, std::uint
             std::uint32_t lo, hi;
             load(at, lo, hi);
             if (const std::uint32_t latency = q_unit_latency(lo, hi)) {
-                (complete(path, latency) ? any_new : any_old) = true;
+                for (const std::vector<std::uint32_t> &context : contexts(at)) (complete(context, path, latency) ? any_new : any_old) = true;
+                if (any_new && any_old) return kQDynamic;
                 continue;
             }
             if (waits_q(lo, hi) || path.size() > 15) {
@@ -558,7 +648,7 @@ inline QRead q_read_kind(const std::uint8_t *code, std::uint32_t mask, std::uint
             }
         }
         const std::vector<std::uint32_t> from = preds(at);
-        if (from.empty()) any_new = true;
+        if (from.empty() && at != entry) any_new = true;
         for (std::uint32_t p : from) {
             std::vector<std::uint32_t> next = path;
             next.push_back(p);
@@ -665,9 +755,9 @@ PS2_VU_INLINE v4u vload_ptr(const void *p) {
 }
 PS2_VU_INLINE v4u vsplat(std::uint32_t x) { return v4u{x, x, x, x}; }
 PS2_VU_INLINE v4u vsel(v4u old, v4u now, v4u mask) { return (now & mask) | (old & ~mask); }
-// The lanes turned for OPMULA / OPMSUB: (y, z, x, w) and (z, x, y, w).
-PS2_VU_INLINE v4u vyzxw(v4u v) { return __builtin_shufflevector(v, v, 1, 2, 0, 3); }
-PS2_VU_INLINE v4u vzxyw(v4u v) { return __builtin_shufflevector(v, v, 2, 0, 1, 3); }
+// The lanes of `v` in the order A, B, C, D (OPMULA and OPMSUB of the compiled programs turn their operands with it).
+template <int A, int B, int C, int D>
+PS2_VU_INLINE v4u vswz(v4u v) { return __builtin_shufflevector(v, v, A, B, C, D); }
 // What the vector units do to every number they take in or give out: an exponent of 255 is an ordinary number that is cut
 // down to the largest float (0x7F7FFFFF), and a denormal becomes a zero with its sign.
 PS2_VU_INLINE v4u vfix_generic(v4u x) {
@@ -877,6 +967,27 @@ PS2_VU_INLINE std::uint32_t clip_value(const Vu0Regs &r, const Reg128 &s, std::u
     return ((r.clip << 6) | clip_flags(vload(s), w)) & 0xFFFFFFu;
 }
 
+// clip_value with vector instructions, for the compiled programs (the same bits on every input, tests/test_vu_clip.cpp). fp::key
+// makes a number with exponent 0 a zero and otherwise compares sign and magnitude as a signed integer, and the limit is the
+// magnitude of w (0 for exponent 0). So a lane is above +|w| when it is positive and its magnitude is above the limit, below
+// -|w| when it is negative and its magnitude is above it; a zero (or a flushed denormal) of either sign is neither.
+inline constexpr std::uint8_t kClipSpread[8] = {0, 1, 4, 5, 16, 17, 20, 21};
+PS2_VU_INLINE std::uint32_t vclip_value(const Vu0Regs &r, const Reg128 &s, std::uint32_t w) {
+#if defined(__SSE2__)
+    __m128i v;
+    std::memcpy(&v, &s, 16);
+    const __m128i zero_exp = _mm_cmpeq_epi32(_mm_and_si128(v, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
+    const __m128i mag = _mm_andnot_si128(zero_exp, _mm_and_si128(v, _mm_set1_epi32(0x7FFFFFFF)));
+    const std::uint32_t lim = (w & 0x7F800000u) ? (w & 0x7FFFFFFFu) : 0u;
+    const __m128i above = _mm_cmpgt_epi32(mag, _mm_set1_epi32(static_cast<int>(lim)));
+    const unsigned pos = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(_mm_andnot_si128(v, above)))) & 7u;
+    const unsigned neg = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(_mm_and_si128(v, above)))) & 7u;
+    return ((r.clip << 6) | kClipSpread[pos] | (static_cast<std::uint32_t>(kClipSpread[neg]) << 1)) & 0xFFFFFFu;
+#else
+    return clip_value(r, s, w);
+#endif
+}
+
 PS2_VU_INLINE void clip(Vu0Regs &r, const Reg128 &s, std::uint32_t w) {
     r.clip = ((r.clip << 6) | clip_flags(vload(s), w)) & 0xFFFFFFu;
 }
@@ -889,6 +1000,7 @@ struct FlagPipe {
     unsigned mh = 0, ch = 0;
     std::uint32_t q_value = 0, q_ready = 0;
     bool q_pending = false;
+    std::uint32_t p_ready = 0;  // the cycle a WAITP or the next EFU instruction may issue at (issue_cycle)
 
     PS2_VU_INLINE std::uint32_t begin_q(Vu0Regs &r) {
         flush_q(r);

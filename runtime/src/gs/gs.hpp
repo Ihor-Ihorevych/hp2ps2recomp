@@ -52,13 +52,34 @@ void state(ps2::state::Stream &s);
 void reset();
 void write(std::uint32_t reg, std::uint64_t value);
 void signal(std::uint32_t reg, std::uint64_t value);
+// With one thread, gif.cpp sends PATH1 packets through write() between path1_drawing(true) and (false): their SIGNAL, FINISH and LABEL
+// are left to gif::deliver_path1 then, as with threads.
+void path1_drawing(bool on);
+// IMR lets SIGNAL or FINISH interrupt the EE (an idle EE then hands PATH1's on, gif::deliver_path1)
+bool path1_may_interrupt();
 void raise_finish();
 void note_transfer(std::uint32_t reg, std::uint64_t value);
+// Emulation thread: the quadwords of the current GS-to-memory download (TRXDIR 1) the game has not read yet, by DMA channel 1 or from
+// the VIF1 FIFO, counted from TRXREG and the pixel format since the last TRXDIR write; -1 when that write did not start a download or
+// no rectangle was ever set (vif.cpp FQC). PS2_TRACE_DOWNLOADS=1 prints each download's size and what the game read of it.
+int download_left();
 void write_packed(std::uint32_t reg, const Reg128 &q);
 void write_packed_run(const std::uint8_t *data, std::uint32_t count, std::uint64_t regs, std::uint32_t nreg, std::uint32_t reg);
 void write_image(const std::uint8_t *data, std::uint32_t qwords);
 void read_image(std::uint8_t *data, std::uint32_t qwords);
 void render_read_image(std::uint8_t *data, std::uint32_t qwords);
+// The depth round trip (gs.cpp). A depth download the emulation thread does not wait for leaves its bytes
+// out of main memory, under a page guard, until something touches them; an upload of exactly those bytes reaches the GIF as a
+// ticket instead of the bytes. trip_match (emulation side): these qwords are such a download's bytes, untouched. trip_fetch (any
+// thread but the drawing one): the bytes, waiting for the drawing thread if need be. trip_restore and trip_bytes (drawing thread):
+// put the saved memory back in place of the upload under way (false if it is not that upload), or give the bytes for a normal one.
+struct TripTicket {
+    std::uint32_t slot = 0, id = 0;
+};
+bool trip_match(const std::uint8_t *data, std::uint32_t qwc, TripTicket &ticket);
+std::vector<std::uint8_t> trip_fetch(const TripTicket &ticket);
+bool trip_restore(const TripTicket &ticket, std::uint32_t qwc);
+const std::vector<std::uint8_t> &trip_bytes(const TripTicket &ticket);
 void render_reset();
 
 std::uint64_t read_privileged(std::uint32_t address);

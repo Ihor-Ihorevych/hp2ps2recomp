@@ -143,7 +143,10 @@ const Instance *instance_for(std::uint32_t pc, bool needs_entry = false) {
         if (const std::uint32_t magic = ld32(at); magic == kModuleMagic || magic == kXffMagic) {
             for (const ModuleInfo &m : g_modules)
                 if (pc - at < m.size && loaded_at(m, at)) {
-                    return add_instance(at, &m, 0);
+                    // The same answer as the loops above give a module that is an instance already: it stays registered either way, and
+                    // with needs_entry it serves pc only when it has that entry (a pc inside a function it translated is not an entry).
+                    const Instance *added = add_instance(at, &m, 0);
+                    return !needs_entry || module_entry(*added, pc, unit) ? added : nullptr;
                 }
             // A stray "xff2" word (a string, data) is not a header: look further back
             if (magic == kModuleMagic) return nullptr;
@@ -215,6 +218,11 @@ void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank
 }
 
 bool window_module_in_place(std::uint32_t pc) { return instance_for(pc) != nullptr; }
+
+int serving_rank(std::uint32_t pc) {
+    if (const Instance *i = instance_for(pc, true)) return i->rank;
+    return -1;
+}
 
 bool window_covered(std::uint32_t base, std::uint32_t size) {
     // A module that holds the range, whatever base it begins at (windows are steps of 16 KiB in one area, and a window inside a

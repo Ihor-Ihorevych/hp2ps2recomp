@@ -9,7 +9,7 @@ here="$ROOT/scripts"
 
 usage() {
   cat <<'EOF'
-usage: scripts/port.sh <name> <game.iso | game.bin | game.cue | game.zip | game.7z> [options]
+usage: scripts/port.sh <name> <game.iso | game.bin | game.cue | game.zip | game.7z | game.chd> [options]
 
 Turns a PS2 disc image you own into a browser build in build/web-<name> and a
 native one in build/native-<name>. It reads the boot program named in
@@ -102,6 +102,21 @@ else
     # an archive with an image in it, or a CD dumped as BIN (with a CUE sheet): disc.py writes the .iso, cutting the 2048-byte
     # sectors out of a 2352-byte-sector dump (follows upstream 0d72093)
     *.zip|*.bin|*.cue|*.img) "${py[@]}" -I "$here/disc.py" iso "$source_path" "$iso" ;;
+    # a CHD (MAME's compressed disc image): chd.py unpacks it to a plain .iso, a DVD byte for byte, a CD as its data track. It
+    # writes the .iso under another name and renames it when done, so a stopped unpack never leaves a half image that looks finished.
+    *.chd)
+      # chdunpack (recomp/chdunpack, built with the translator tools) unpacks on all cores in a couple of minutes; chd.py runs it when it
+      # is there and does the same alone, about ten times slower, when it is not (a build that failed, a tools folder from before it existed)
+      if [ -f "$tools/build.ninja" ] && [ ! -x "$tools/chdunpack" ]; then
+        echo "Building the disc image unpacker"
+        ninja -C "$tools" chdunpack > "$tools/ninja-chdunpack.log" 2>&1 || echo "the unpacker could not be built (see $tools/ninja-chdunpack.log): using the slower Python code"
+      fi
+      if [ -x "$tools/chdunpack" ]; then
+        echo "Unpacking the .chd disc image into a normal disc image (the game keeps it): this takes a few minutes"
+      else
+        echo "Unpacking the .chd disc image into a normal disc image (the game keeps it): this takes a long time without the native unpacker"
+      fi
+      "${py[@]}" -I "$here/chd.py" iso "$source_path" "$iso" || { rm -f "$iso" "$iso.part"; exit 1; } ;;
     *.7z)
       sevenzip=7z
       [ "$windows" = 0 ] || command -v 7z > /dev/null || sevenzip="${PROGRAMFILES:-/c/Program Files}/7-Zip/7z.exe"
@@ -287,7 +302,7 @@ if [ "$elf" = "$game/disc/$program" ]; then
 else
   play=$(printf '%q %q --disc %q --window' "build/native-$name/ps2run" "${elf#$ROOT/}" "${iso#$ROOT/}")
 fi
-play="$play --game-dir $(printf '%q' "games/$name")"
+play="$play --game-dir $(printf '%q' "games/$name") --memcard $(printf '%q' "games/$name/$name.ps2")"
 [ ${#wide[@]} -eq 0 ] || play="$play --widescreen"
 [ ${#patches[@]} -eq 0 ] || play="$play --patches $(printf '%q' "games/$name/patches.txt")"
 echo "Play it natively:  $play"

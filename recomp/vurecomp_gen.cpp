@@ -174,7 +174,7 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, FlagMode mode
     }
     if (kind == Nop) return u;
     if (kind == Clip) {
-        u.pre = std::format("const std::uint32_t uclip = clip_value(r, r.vf[{}], r.vf[{}].w[3]); ", fs, ft);
+        u.pre = std::format("const std::uint32_t uclip = vclip_value(r, r.vf[{}], r.vf[{}].w[3]); ", fs, ft);
         u.post = "r.clip = uclip; fl.set_clip(uclip, fl.t); ";
         return u;
     }
@@ -190,11 +190,12 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, FlagMode mode
         }
     };
     const std::string dst = target == kAcc ? "r.acc" : std::format("r.vf[{}]", target);
-    // OPMULA and OPMSUB are a MUL and an MSUB of the operands' lanes turned (fs as y z x, ft as z x y; x y z written): each lane is the
-    // same float operation as the lane-by-lane form (mul / msub on that lane's numbers), done for the three lanes at once.
+    // OPMULA and OPMSUB (the cross product) are a MUL and an MSUB of the operands' lanes turned (y, z, x) and (z, x, y): done as one
+    // vector operation on the turned shadows, they give the bits of the three scalar mul()/msub() of the lanes (the same per-lane rule as
+    // MUL and MSUB, vu_ops.hpp), without three separate 4-byte stores that the next 16-byte read of the register waits for.
     const bool outer = kind == Opmula || kind == Opmsub;
     const bool vector = !exact && (kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || kind == Max || kind == Min || kind == Abs || kind == Ftoi || kind == Itof || outer);
-    const bool arithmetic = kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || (outer && !exact);
+    const bool arithmetic = kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || outer;
     if (target != 0) {
         u.target = target;
         u.mask = d;
@@ -219,8 +220,8 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, FlagMode mode
         }
         std::string ns = operand(fs);
         if (outer) {
-            ns = std::format("vyzxw({})", ns);
-            nb = std::format("vzxyw({})", nb);
+            ns = std::format("vswz<1, 2, 0, 3>({})", ns);
+            nb = std::format("vswz<2, 0, 1, 3>({})", nb);
         }
         if (kind == Madd || kind == Msub || kind == Opmsub) u.shadow_reads.push_back(kAcc);
         // vf00 is the constant (0, 0, 0, 1), and its broadcast lanes are 0 or 1. Both operands have been through vfix, so a sum, difference
@@ -234,7 +235,8 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, FlagMode mode
         switch (kind) {
         case Add: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} + (v4f){}); ", ns, nb) : std::format("const v4u uv = vaddd({}, {}); ", ns, nb); break;
         case Sub: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} - (v4f){}); ", ns, nb) : std::format("const v4u uv = vsubd({}, {}); ", ns, nb); break;
-        case Mul: case Opmula: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} * (v4f){}); ", ns, nb) : std::format("const v4u uv = vmuld({}, {}); ", ns, nb); break;
+        case Mul:
+        case Opmula: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} * (v4f){}); ", ns, nb) : std::format("const v4u uv = vmuld({}, {}); ", ns, nb); break;
         case Madd: u.pre += constant_lanes ? std::format("const v4u uv = vaddd(nacc, (v4u)((v4f){} * (v4f){})); ", ns, nb) : std::format("const v4u uv = vmaddd(nacc, {}, {}); ", ns, nb); break;
         default: u.pre += constant_lanes ? std::format("const v4u uv = vsubd(nacc, (v4u)((v4f){} * (v4f){})); ", ns, nb) : std::format("const v4u uv = vmsubd(nacc, {}, {}); ", ns, nb); break;
         }
@@ -1063,7 +1065,7 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         // an instruction that reads Q brings the quotient up to date first, on both ways into a split slot
         std::string qread;
         if (any_q && ps2::vu::reads_q(hi)) {
-            const ps2::vu::QRead kind = ps2::vu::q_read_kind(p.code.data(), kMask, pc);
+            const ps2::vu::QRead kind = ps2::vu::q_read_kind(p.code.data(), kMask, pcs, p.entry, pc);
             if (kind == ps2::vu::kQNew) qread = "fl.flush_q(r); ";
             else if (kind == ps2::vu::kQDynamic) qread = "fl.sync_q(r); ";
         }
@@ -1194,7 +1196,12 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp). 16: VU1 programs keyed by program_key_moved, with the shift `sh` in them.
-const char *const kGeneratorVersion = "vurecomp 19";   // 19: the register file of a lazy program body is __restrict__ (the compiler keeps registers in machine registers across the stores to the data memory; the body hands over with vhop and returns, nothing else touches the registers meanwhile); 18: a jump to the program's own entry goes round inside the function (again:); 17: a kick goes out one pair late (vu::kick(1, 0xFFFF) after the pair that follows it)
+// 20: merge of upstream (EFU/WAITP stalls, Q read decided from the program's own pairs) with the Flipendo line below.
+// 19: the register file of a lazy program body is __restrict__ (the compiler keeps registers in machine registers across the stores to the
+//     data memory; the body hands over with vhop and returns, nothing else touches the registers meanwhile); 18: a jump to the program's
+//     own entry goes round inside the function (again:); 17: a kick goes out one pair late (vu::kick(1, 0xFFFF) after the pair that
+//     follows it). Upstream 17: a read of Q decided from the program's own pairs only (q_read_kind with the entry).
+const char *const kGeneratorVersion = "vurecomp 20";
 
 // The key a program is built and found under, worked out from its code: VU0 keeps program_key (the address counts), VU1 has program_key_moved
 // (the same code at any address is one program). A recording of the old kind (VU1, its name holds a key that counted the address) is a

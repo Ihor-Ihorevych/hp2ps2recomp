@@ -908,11 +908,12 @@ void menu_paint(bool show_again = true) {
     int w = 0, h = 0;
     window_pixels(w, h);
     if (g_menu.is_open()) {
+        g_scale_now = g_scale_next = static_cast<int>(ps2::video_scale());
         quickmenu::Values v;
         v.look = keymap::look_name(g_look);
         v.scale_now = g_scale_now;
         v.scale_next = g_scale_next;
-        v.scale_locked = g_scale_locked;
+        v.scale_locked = false;
         v.sharp_now = g_sharp_now;
         v.sharp_next = g_sharp_next;
         v.sharp_locked = g_sharp_locked;
@@ -1093,15 +1094,12 @@ void menu_command(quickmenu::Command c, int step) {
         return;
     case Command::look: cycle_look(step); break;
     case Command::scale:
-        if (g_scale_locked) {
-            set_notice("The resolution is set by PS2_SCALE; remove it to choose here");
-            break;
-        }
-        g_scale_next = (g_scale_next - 1 + step + 4) % 4 + 1;
+        g_scale_now = g_scale_next = (static_cast<int>(ps2::video_scale()) - 1 + step + 4) % 4 + 1;
+        ps2::set_video_scale(static_cast<std::uint32_t>(g_scale_next));
         g_keys.scale = g_scale_next;
         rewrite_keys_file([](const std::string &t) { return keymap::with_scale(t, g_scale_next); }, "resolution");
-        set_notice("Resolution " + std::to_string(g_scale_next) + "x" + (g_scale_next == g_scale_now ? "" : ": used when the game starts the next time"));
-        std::fprintf(stderr, "[menu] resolution %dx for the next start (this run: %dx)\n", g_scale_next, g_scale_now);
+        set_notice("Resolution " + std::to_string(g_scale_next) + "x" + (g_scale_locked ? " (PS2_SCALE still sets the next start)" : ""));
+        std::fprintf(stderr, "[menu] resolution switched live to %dx\n", g_scale_next);
         break;
     case Command::sharp_2d:
         if (g_sharp_locked) {
@@ -1543,6 +1541,11 @@ void show_speed() {
     static std::uint64_t start = 0, frames = 0;
     static double cpu_start = 0.0, gpu_start = 0.0;
     const std::uint64_t now = SDL_GetPerformanceCounter();
+    const int cur_scale = static_cast<int>(ps2::video_scale());
+    if (cur_scale != g_scale_now) {
+        g_scale_now = g_scale_next = g_keys.scale = cur_scale;
+        rewrite_keys_file([cur_scale](const std::string &t) { return keymap::with_scale(t, cur_scale); }, "resolution");
+    }
     if (!start) {
         start = now;
         cpu_start = process_cpu_seconds();
@@ -1880,7 +1883,8 @@ bool open_window(bool fullscreen) {
     g_scale_now = std::clamp(std::atoi(ps2::os::env("PS2_SCALE").c_str()), 1, 4);
     // how the picture fills the window: PS2_DISPLAY_MODE 0 original 4:3, 1 stretch, 2 zoom (crop); the Android settings change it live
     if (!ps2::os::env("PS2_DISPLAY_MODE").empty()) ps2::set_display_mode(std::atoi(ps2::os::env("PS2_DISPLAY_MODE").c_str()));
-    g_scale_next = g_scale_locked ? g_scale_now : (g_keys.scale >= 1 ? g_keys.scale : g_scale_now);
+    g_scale_next = g_scale_now;
+    ps2::set_video_scale(static_cast<std::uint32_t>(g_scale_now));
     // the 2D art filter the same way: PS2_SHARP_2D, else the 'sharp_2d' line of keys.ini, else sharp (gpu.cpp reads it at its start)
     g_sharp_locked = !ps2::os::env("PS2_SHARP_2D").empty();
     if (!g_sharp_locked && g_keys.sharp_2d >= 0) ps2::os::set_env("PS2_SHARP_2D", std::to_string(g_keys.sharp_2d));

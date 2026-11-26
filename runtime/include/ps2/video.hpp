@@ -12,4 +12,6 @@ std::uint32_t video_options();
 // no bars). Display only, changes live.
 void set_display_mode(int mode);
 int display_mode();
+void set_video_scale(std::uint32_t scale);
+std::uint32_t video_scale();
 }

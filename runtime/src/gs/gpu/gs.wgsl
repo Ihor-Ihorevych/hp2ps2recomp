@@ -23,6 +23,16 @@ override SLIM_TAPS: bool = true;
 
 override SCALE: u32 = 1u;
 override TILE: u32 = 16u;
+// The tile lists are kept per strip of two pixel rows (gpu.cpp PS2_GPU_STRIPS, tiles.hpp): a tile's table entry holds one list per strip, and each
+// strip is drawn by a workgroup of its own (TILE x 2 threads: ROWS = 2), which walks only the strip's list. One workgroup per strip, not four strips in
+// one TILE x TILE workgroup: the list's start and length must be the same for the whole workgroup, or the compiler reads every shape per thread
+// (a first try that took the strip from the thread's row ran the raster program 2.8 times as long on Intel graphics, with the same pictures).
+override STRIPS: bool = false;
+override ROWS: u32 = 16u;  // rows of a raster workgroup: TILE, or 2 with STRIPS or SPLIT (set by gpu.cpp)
+// Split tiles (gpu.cpp PS2_GPU_STRIPS=2): the lists stay per tile, as without strips, but each strip of two pixel rows of a tile is drawn by a
+// workgroup of its own (TILE x 2 threads, ROWS = 2), which walks the tile's whole list. On a laptop's Intel graphics this alone gave most of what
+// the lists per strip saved in the God of War fights, with no extra work for the processor.
+override SPLIT: bool = false;
 
 override EXPLICIT_FMA: bool = false;
 // Mipmap levels (docs/mipmap.md). The program that reads them takes about twice as long to translate on FXC (Direct3D 12 without DXC), so
@@ -295,13 +305,54 @@ fn cache_bits_at(offset: u32, bit: u32, count: u32) -> u32 {
 }
 
 
+// One upload command: records of 12 words (prm(0) where, prm(1) how many), one thread per pixel in the order the pixels arrive. With prm(3) = 1
+// (gpu.cpp emit_pre, PS2_GPU_UPLOAD_BLOCKS) the records have 16 words and each workgroup takes an 8 x 8 square of a record's rectangle instead:
+// word 11 is the record's first square, 12 and 13 the column and row of its top-left square, 14 the squares per row. The same pixel gets the same
+// value through the same write as before; only which thread does it changes. The squares make the threads that run side by side write
+// neighbouring places of graphics memory (a 32-bit texture's 8 x 8 block is 256 bytes in a row), and the search for the record and the
+// division of a pixel's number by the row width are done once per square instead of once per pixel.
 @compute @workgroup_size(64)
-fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn upload(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let records = prm(0u);
+    var r = 0u;
+    var k = 0u;
+    var x = 0u;
+    var y = 0u;
+    if (prm(3u) == 1u) {
+        let g = wid.x + wid.y * 1024u;
+        if (g >= prm(2u)) {
+            return;
+        }
+        var lo = 0u;
+        var hi = prm(1u);
+        while (hi - lo > 1u) {
+            let mid = (lo + hi) / 2u;
+            if (data[records + mid * 16u + 11u] <= g) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        r = records + lo * 16u;
+        let b = g - data[r + 11u];
+        let across = data[r + 14u];
+        let row = b / across;
+        let ux = (data[r + 12u] + b - row * across) * 8u + (lid & 7u);
+        let uy = (data[r + 13u] + row) * 8u + (lid >> 3u);
+        let rrw = data[r + 5u];
+        let dx = ux - data[r + 3u];
+        let dy = uy - data[r + 4u];
+        k = dy * rrw + dx - data[r + 6u];
+        if (dx >= rrw || dy > 0x7FFu || k >= data[r + 7u]) {
+            return;
+        }
+        x = ux & 0x7FFu;
+        y = uy & 0x7FFu;
+    } else {
     let i = gid.x + gid.y * 64u * 1024u;
     if (i >= prm(2u)) {
         return;
     }
-    let records = prm(0u);
     var lo = 0u;
     var hi = prm(1u);
     while (hi - lo > 1u) {
@@ -312,12 +363,13 @@ fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
             hi = mid;
         }
     }
-    let r = records + lo * 12u;
-    let k = i - data[r + 11u];
+    r = records + lo * 12u;
+    k = i - data[r + 11u];
     let rrw = data[r + 5u];
     let p = data[r + 6u] + k;
-    let x = (data[r + 3u] + p % rrw) & 0x7FFu;
-    let y = (data[r + 4u] + p / rrw) & 0x7FFu;
+    x = (data[r + 3u] + p % rrw) & 0x7FFu;
+    y = (data[r + 4u] + p / rrw) & 0x7FFu;
+    }
     let bpp = data[r + 10u] & 0xFFu;
     var v = 0u;
     if ((data[r + 10u] & 0x80000000u) != 0u) {
@@ -739,6 +791,9 @@ fn texel_y(s: Setup, yi: i32) -> u32 {
 
 var<private> snapshot_lo: u32 = 0u;
 var<private> snapshot_hi: u32 = 0u;
+// The copy keeps `snapshot_run` words of every `snapshot_stride` (whole pages of a rectangle of the frame); between the runs it holds old data, never read.
+var<private> snapshot_stride: u32 = 1u;
+var<private> snapshot_run: u32 = 1u;
 // A sprite that copies a rendered picture (a colour or depth format) at almost 1:1 but not exactly, with a slight zoom or a
 // fractional offset, reads it on the inner-resolution grid (rt_copy, set per pixel in shade_at): texel X / SCALE and sub-sample
 // X % SCALE on each axis. Read on the console's grid with the output pixel's own sub-sample, such a copy lands up to one console
@@ -746,9 +801,31 @@ var<private> snapshot_hi: u32 = 0u;
 // Devil Saga blends the last frame, 0.2 % larger and half a pixel off, over each new one (an afterimage glow); exact 1:1 copies
 // are unchanged.
 var<private> rt_copy: bool = false;
+// 1 / snapshot_stride, so that in_snapshot finds the place in a run without an integer division (the chip has none: it costs a long sequence)
+var<private> snapshot_inv: f32 = 1.0;
+
+// Whether graphics memory word `word` is in the batch's snapshot: inside its range and within one of its runs. The remainder by the stride
+// comes from a float quotient that is at most one off for these numbers (word counts below 2^24), then put right: exactly what % gives.
+fn in_snapshot(word: u32) -> bool {
+    if (word < snapshot_lo || word >= snapshot_hi) {
+        return false;
+    }
+    if (snapshot_run >= snapshot_stride) {
+        return true;
+    }
+    let d = word - snapshot_lo;
+    var r = i32(d) - i32(u32(f32(d) * snapshot_inv) * snapshot_stride);
+    if (r < 0) {
+        r = r + i32(snapshot_stride);
+    }
+    if (r >= i32(snapshot_stride)) {
+        r = r - i32(snapshot_stride);
+    }
+    return u32(r) < snapshot_run;
+}
 
 fn load_texel(l: Loc, k: u32) -> u32 {
-    if (l.word >= snapshot_lo && l.word < snapshot_hi) {
+    if (in_snapshot(l.word)) {
         return (scratch[(l.word - snapshot_lo) * SCALE * SCALE + k] >> l.shift) & l.mask;
     }
     return load_at(l, k);
@@ -896,7 +973,7 @@ fn tap_clut(s: Setup, page: u32, n: u32, nbit: u32, slot: u32, k: u32) -> u32 {
 fn tap32(s: Setup, page: u32, n: u32, k: u32) -> u32 {
     let word = ((page + (n << 2u)) & 0x3FFFFFu) >> 2u;
     var raw = 0u;
-    if (word >= snapshot_lo && word < snapshot_hi) {
+    if (in_snapshot(word)) {
         raw = scratch[(word - snapshot_lo) * SCALE * SCALE + k];
     } else {
         raw = atomicLoad(&vram[word * SCALE * SCALE + k]);
@@ -926,6 +1003,9 @@ fn conv24(s: Setup, raw: u32) -> u32 {
 // colour is the texel's own and the edges stay smooth. A sprite that copies an upscaled picture one to one gets closer to the
 // picture's own samples too (plain bilinear blends each with the same sample of the neighbouring pixel).
 override SHARP: u32 = 0u;
+// A 2D piece drawn as two triangles reads its texture only within the native pixels it covers when upscaled, as a sprite does (shade_at;
+// PS2_SCALE_EDGES=0 turns it off)
+override EDGE_CLAMP: bool = true;
 var<private> sharp_sprite: bool = false;
 var<private> upscaled_source: bool = false;
 
@@ -1554,25 +1634,50 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             let ce0 = cross2(x1 - cx, y2 - cy, x2 - cx, y1 - cy) * inv;
             let ce1 = cross2(x2 - cx, y0 - cy, x0 - cx, y2 - cy) * inv;
             let ce2 = cross2(x0 - cx, y1 - cy, x1 - cx, y0 - cy) * inv;
-            let in0 = edge_in(select(s0, ce0, a0), inclusive & 1u);
-            let in1 = edge_in(select(s1, ce1, a1), inclusive & 2u);
-            let in2 = edge_in(select(c2, ce2, a2), inclusive & 4u);
+            // Such a half covers a sample only when the console pixel's centre lies in the whole rectangle, i.e. the triangle's
+            // bounding box (left and top inclusive, as the edge rule): the half's own two straight edges are only two of the
+            // rectangle's four. Tested on those two alone, the half below a diagonal took the samples next to its far corner whose
+            // pixel centre is in the rectangle to its left or above, while that rectangle took them too (its pixel), and the
+            // samples there that neither half wanted stayed empty: every shared edge of a mesh of 2D pieces drew a line, bright
+            // where an added glow was drawn twice (Medal of Honor: Vanguard's muzzle flash at 4x, public #114).
+            let rx0 = min(x0, min(x1, x2));
+            let rx1 = max(x0, max(x1, x2));
+            let ry0 = min(y0, min(y1, y2));
+            let ry1 = max(y0, max(y1, y2));
+            if (rect && (cx < rx0 || cx >= rx1 || cy < ry0 || cy >= ry1)) {
+                return;
+            }
+            // Inside the rectangle the diagonal decides at the sample (the two halves meet there at the finer resolution); a sample
+            // outside the rectangle (past its right or bottom edge, in a pixel whose centre is inside) belongs to the half that holds
+            // the pixel's centre, as on the console, and takes its colour, texture coordinates and depth from that centre, not from
+            // beyond the shape. Both halves see the same rectangle, so each such sample is taken by exactly one of them; a sliver
+            // whose straight edge passes a pixel centre does not spread into the rows beyond it (lines along the rain ripples).
+            let inside = px >= rx0 && px < rx1 && py >= ry0 && py < ry1;
+            let at_s = !rect || inside;
+            let in0 = a0 || edge_in(select(ce0, s0, at_s), inclusive & 1u);
+            let in1 = a1 || edge_in(select(ce1, s1, at_s), inclusive & 2u);
+            let in2 = a2 || edge_in(select(ce2, c2, at_s), inclusive & 4u);
             if (!in0 || !in1 || !in2) {
                 return;
             }
-            // A sample outside such an edge is covered only when its console pixel is, i.e. when the pixel's centre is inside
-            // the whole triangle (as on the console); the slanted edges alone would let a sliver whose straight edge passes a
-            // pixel centre spread into the rows beyond it (lines along the rain ripples). Such a sample takes its colour,
-            // texture coordinates and depth from the pixel's centre, as the console's pixel does, not from beyond the shape.
-            let out0 = a0 && !edge_in(s0, inclusive & 1u);
-            let out1 = a1 && !edge_in(s1, inclusive & 2u);
-            let out2 = a2 && !edge_in(c2, inclusive & 4u);
-            if ((out0 || out1 || out2) && !(edge_in(ce0, inclusive & 1u) && edge_in(ce1, inclusive & 2u) && edge_in(ce2, inclusive & 4u))) {
-                return;
+            let extended = !at_s;
+            var qx = select(px, cx, extended);
+            var qy = select(py, cy, extended);
+            // The finer samples of the last native pixel row and column lie past its corner (x + 1/SCALE ...), where a 2D piece's
+            // texture coordinates run on beyond the texels the console reads: the neighbour on the texture sheet (another letter,
+            // another icon, the sheet's border) shows as a thin line along the piece's right and bottom edges, filtered or not (lines
+            // around text and in menus at 2x and up). As for sprites: the colour, texture coordinates and depth are taken within the
+            // native pixels the rectangle covers, so its edges end on its own texels as at native size; inside it nothing changes.
+            // Only the last native column and row move (the samples there all take the place of its corner, which the console reads);
+            // at 1x `rect` is false. An upscaled picture read back by its own samples (a full-screen effect drawn in strips) is left
+            // alone, as for sprites: its samples lie inside the native pixels it covers, and flattening them would make each strip's
+            // last column blocky.
+            if (rect && EDGE_CLAMP && !upscaled_source) {
+                let ax = ceil(rx0);
+                let ay = ceil(ry0);
+                qx = clamp(qx, ax, max(ax, ceil(rx1) - 1.0));
+                qy = clamp(qy, ay, max(ay, ceil(ry1) - 1.0));
             }
-            let extended = out0 || out1 || out2;
-            let qx = select(px, cx, extended);
-            let qy = select(py, cy, extended);
             let w0 = cross2(x1 - qx, y2 - qy, x2 - qx, y1 - qy) * inv;
             let w1 = cross2(x2 - qx, y0 - qy, x0 - qx, y2 - qy) * inv;
             let w2 = 1.0 - w0 - w1;
@@ -1758,7 +1863,9 @@ fn snapshot(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= prm(1u)) {
         return;
     }
-    scratch[i] = atomicLoad(&vram[prm(0u) * SCALE * SCALE + i]);
+    let run = prm(3u) * SCALE * SCALE;
+    let at = (i / run) * prm(2u) * SCALE * SCALE + i % run;
+    scratch[at] = atomicLoad(&vram[prm(0u) * SCALE * SCALE + at]);
 }
 
 @compute @workgroup_size(64)
@@ -1770,77 +1877,59 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     scratch[i] = atomicLoad(&vram[i * SCALE * SCALE]);
 }
 
-// A dispatch may carry several drawing runs (fuse_runs in gpu.cpp). With word 8 of the parameter record at 0 it is one run, as always: word 0 is
-// its table of tiles (origin and first list entry, two words each), 3 their number. With word 8 = M it is M runs, in the order they were drawn:
-// word 0 is a table with a row of M + 1 words for each tile of any of them (the origin, then for each run where its entry for this tile is, or
-// ~0 when it has none), 3 the number of rows, and run r has its prims, setups, lists and mips words at 16 + 4 * r. A thread does the runs' lists
-// for its tile one after the other.
-@compute @workgroup_size(TILE, TILE)
+@compute @workgroup_size(TILE, ROWS)
 fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let index = wid.x + wid.y * 1024u;
+    let group = wid.x + wid.y * 1024u;
+    // with STRIPS or SPLIT the workgroups are the strips, TILE / 2 per tile
+    let split = STRIPS || SPLIT;
+    let index = select(group, group / (TILE / 2u), split);
+    let strip = select(0u, group % (TILE / 2u), split);
     if (index >= prm(3u)) {
         return;
     }
-    let runs = prm(8u);
-    var entry = prm(0u) + index * 2u;
-    if (runs != 0u) {
-        entry = prm(0u) + index * (runs + 1u);
-    }
-    let origin = data[entry];
+    // per tile: (x | y << 16, start of its list), the next entry's start ends it; with STRIPS: (x | y << 16, start of each strip's list, end of the last)
+    let tile = prm(0u) + index * select(2u, TILE / 2u + 2u, STRIPS);
+    let origin = data[tile];
+    let at = tile + 1u + select(0u, strip, STRIPS);  // SPLIT: every strip walks its tile's one list
     let sx = (origin & 0xFFFFu) * TILE + lid.x;
-    let sy = (origin >> 16u) * TILE + lid.y;
+    let sy = (origin >> 16u) * TILE + strip * 2u + lid.y;
     let x = i32(sx / SCALE);
     let y = i32(sy / SCALE);
     let k = (sy % SCALE) * SCALE + sx % SCALE;
     let px = f32(x) + f32(sx % SCALE) / f32(SCALE);
     let py = f32(y) + f32(sy % SCALE) / f32(SCALE);
+    let first = data[at];
+    let count = data[at + select(2u, 1u, STRIPS)] - first;
+    let lists = prm(4u);
+    let prims = prm(1u);
+    let setups = prm(2u);
     snapshot_lo = prm(5u);
     snapshot_hi = prm(6u);
-    for (var r = 0u; r < max(runs, 1u); r = r + 1u) {
-        var tile = entry;
-        var lists = prm(4u);
-        var prims = prm(1u);
-        var setups = prm(2u);
-        var mips = prm(9u);  // words 7 is not used here
-        if (runs != 0u) {
-            tile = data[entry + 1u + r];
-            if (tile == 0xFFFFFFFFu) {
-                continue;
+    snapshot_stride = max(prm(7u), 1u);
+    snapshot_run = prm(8u);
+    snapshot_inv = 1.0 / f32(snapshot_stride);
+    let mips = prm(9u);
+    var last_setup = 0xFFFFFFFFu;
+    var s: Setup;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let h = first + i;
+        let p = prims + ((data[lists + (h >> 1u)] >> ((h & 1u) * 16u)) & 0xFFFFu) * PRIM_WORDS;
+        let si = data[p];
+        if (si != last_setup) {
+            s = load_setup(setups + si * SETUP_WORDS);
+            if (HAS_MIP && mips != 0xFFFFFFFFu) {
+                s.mip_at = mips + si * MIP_WORDS;
+                s.mip = data[s.mip_at];
             }
-            prims = prm(16u + r * 4u);
-            setups = prm(17u + r * 4u);
-            lists = prm(18u + r * 4u);
-            mips = prm(19u + r * 4u);
+            pix_fl = addr(s.ff, u32(x), u32(y));
+            pix_zl = addr(s.zf, u32(x), u32(y));
+            last_setup = si;
         }
-        let first = data[tile + 1u];
-        let count = data[tile + 3u] - first;
-        var last_setup = 0xFFFFFFFFu;
-        var s: Setup;
-        for (var i = 0u; i < count; i = i + 1u) {
-            let h = first + i;
-            let p = prims + ((data[lists + (h >> 1u)] >> ((h & 1u) * 16u)) & 0xFFFFu) * PRIM_WORDS;
-            var head = vec4<u32>(data[p], 0u, data[p + 2u], data[p + 3u]);  // set-up, kind, box corners
-            if (WIDE_LOADS) {
-                head = data4[p >> 2u];
-            }
-            let si = head.x;
-            if (si != last_setup) {
-                s = load_setup(setups + si * SETUP_WORDS);
-                if (HAS_MIP && mips != 0xFFFFFFFFu) {
-                    s.mip_at = mips + si * MIP_WORDS;
-                    s.mip = data[s.mip_at];
-                }
-                pix_fl = addr(s.ff, u32(x), u32(y));
-                pix_zl = addr(s.zf, u32(x), u32(y));
-                last_setup = si;
-            }
-            let lo = head.z;
-            let hi = head.w;
-            if (x < i32(lo & 0xFFFFu) || y < i32(lo >> 16u) || x > i32(hi & 0xFFFFu) || y > i32(hi >> 16u)) {
-                continue;
-            }
-            shade_at(p, s, x, y, k, px, py);
+        let lo = data[p + 2u];
+        let hi = data[p + 3u];
+        if (x < i32(lo & 0xFFFFu) || y < i32(lo >> 16u) || x > i32(hi & 0xFFFFu) || y > i32(hi >> 16u)) {
+            continue;
         }
+        shade_at(p, s, x, y, k, px, py);
     }
-
 }

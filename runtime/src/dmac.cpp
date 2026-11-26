@@ -201,6 +201,7 @@ void interleave(int ch, Block block) {
 
 void run_normal(int ch) {
     Channel &c = g_ch[ch];
+    std::uint32_t read_qwc = 0;
     if (ch == 8) {
         if (interleaved(c)) {
             interleave(8, [&](std::uint32_t n) { spr_to_ram(c, n); });
@@ -219,6 +220,7 @@ void run_normal(int ch) {
     } else if ((c.chcr & 1u) || ch == 2 || ch == 0 || ch == 9) {
         deliver(ch, c.madr, c.qwc);
     } else if (ch == 1) {
+        read_qwc = c.qwc;
         for (std::uint32_t i = 0, n = 1; i < c.qwc; i += n, n = 1) {
             while (i + n < c.qwc && target(c.madr + (i + n) * 16) == target(c.madr + i * 16) + n * 16) ++n;
             gs::read_image(target(c.madr + i * 16), n);
@@ -229,6 +231,12 @@ void run_normal(int ch) {
     }
     c.madr += c.qwc * 16;
     c.qwc = 0;
+    if (read_qwc) {
+        // A GS readback takes bus time. An immediate completion can merge with a pending
+        // VIF1 upload interrupt before the game has a chance to enable the channel IRQ.
+        schedule(hw::kEventVif1Read, now() + 2ull * read_qwc, finish_vif1_read);
+        return;
+    }
     if (vif_stalled(ch)) {
         pause(ch, true);
         return;
@@ -403,6 +411,12 @@ void start(int ch) {
 
 }
 
+void finish_vif1_read() {
+    if (!(g_ch[1].chcr & 0x100u)) return;
+    if (vif_stalled(1)) pause(1, true);
+    else finish(1);
+}
+
 void resume(int ch) {
     const ps2::prof::Scope prof_scope(ps2::prof::kDma);
     Channel &c = g_ch[ch];
@@ -490,6 +504,8 @@ std::size_t ipu_push_many(const std::uint8_t *qwords, std::size_t count) {
 }
 
 void reset() {
+    if (scheduled_at(hw::kEventVif1Read) != UINT64_MAX)
+        schedule(hw::kEventVif1Read, UINT64_MAX, [] {});
     for (Channel &c : g_ch) c = Channel{};
     g_ctrl = g_pcr = g_sqwc = g_rbsr = g_rbor = g_stadr = g_enable = 0;
     g_start_pending = 0;
@@ -575,7 +591,11 @@ void write(std::uint32_t a, std::uint32_t v) {
             if (!(v & 0x100u)) {
                 c.paused = false;
                 g_start_pending &= ~(1u << ch);
-                if (ch == 1) g_mfifo_waiting = false;
+                if (ch == 1) {
+                    g_mfifo_waiting = false;
+                    if (scheduled_at(hw::kEventVif1Read) != UINT64_MAX)
+                        schedule(hw::kEventVif1Read, UINT64_MAX, [] {});
+                }
             }
             if (!was && (v & 0x100u)) {
                 if (g_enable & kHold) g_start_pending |= 1u << ch;

@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,9 @@
 #include <vector>
 
 namespace ps2::kernel {
+
+// PS2_TRACE_INTC=1: the EE interrupt side in the log. Off by default; every place that traces tests this one flag.
+bool g_trace_irq = std::getenv("PS2_TRACE_INTC") != nullptr;
 
 namespace {
 
@@ -104,7 +108,23 @@ int g_current = 0;
 int g_next_handler = 1;
 std::uint64_t g_order = 0;
 bool g_in_handler = false;
-std::vector<std::uint32_t> g_guest_calls;
+// The game routines the kernel is running to the end right now (run_guest), innermost last: what each is, where, and since when.
+// A routine that never returns is stuck there with the clock still running (issue #127), so the closing lines and the F9 report name
+// it. Written on entry and on return only, never per instruction.
+enum class Routine : std::uint8_t { kIntc = 1, kDmac, kAlarm, kSyscall };
+struct GuestCall {
+    std::uint32_t address;
+    Routine kind;
+    std::uint32_t number;  // the INTC cause, DMAC channel, alarm id or system call number
+    std::uint64_t cycles, frame;  // game time and refresh count at entry
+};
+std::vector<GuestCall> g_guest_calls;
+// The innermost one again, for the window thread (the F9 report written when the emulation does not answer): kind << 24 | number
+// (0 = none), address, refresh count at entry. Relaxed: a hint read while the emulation runs.
+std::atomic<std::uint32_t> g_live_routine{0}, g_live_address{0};
+std::atomic<std::uint64_t> g_live_frame{0};
+// The routine a halt (the window closed, the frame limit) broke out of after it had run for a while; printed with the closing lines.
+std::string g_stuck_line;
 bool g_reschedule = false;
 std::vector<int> g_pending_alarms;
 std::uint32_t g_vsync_flag = 0, g_vsync_data = 0;
@@ -203,8 +223,33 @@ void release(Thread &t, std::int64_t result) {
     else make_ready(t);
 }
 
-std::uint32_t run_guest(Cpu &c, std::uint32_t address, std::uint32_t a0, std::uint32_t a1, std::uint32_t a2, std::uint32_t gp,
-                        std::uint32_t a3 = 0) {
+const char *irq_name(bool dmac, unsigned n);
+
+// "INTC 2 (VBLANK start) handler", "alarm 3 callback", "system call 0x40 (set by the game)"
+std::string routine_words(Routine kind, std::uint32_t number) {
+    char b[64];
+    switch (kind) {
+    case Routine::kIntc: std::snprintf(b, sizeof b, "INTC %u (%s) handler", number, irq_name(false, number)); break;
+    case Routine::kDmac: std::snprintf(b, sizeof b, "DMAC %u (%s) handler", number, irq_name(true, number)); break;
+    case Routine::kAlarm: std::snprintf(b, sizeof b, "alarm %u callback", number); break;
+    default: std::snprintf(b, sizeof b, "system call 0x%02X (set by the game)", number); break;
+    }
+    return b;
+}
+
+void publish_routine() {
+    if (g_guest_calls.empty()) {
+        g_live_routine.store(0, std::memory_order_relaxed);
+        return;
+    }
+    const GuestCall &g = g_guest_calls.back();
+    g_live_address.store(g.address, std::memory_order_relaxed);
+    g_live_frame.store(g.frame, std::memory_order_relaxed);
+    g_live_routine.store(static_cast<std::uint32_t>(g.kind) << 24 | (g.number & 0xFFFFFFu), std::memory_order_relaxed);
+}
+
+std::uint32_t run_guest(Cpu &c, Routine kind, std::uint32_t number, std::uint32_t address, std::uint32_t a0, std::uint32_t a1, std::uint32_t a2,
+                        std::uint32_t gp, std::uint32_t a3 = 0) {
     ThreadContext saved;
     save_context(c, saved);
     const bool nested = g_in_handler;
@@ -219,14 +264,27 @@ std::uint32_t run_guest(Cpu &c, std::uint32_t address, std::uint32_t a0, std::ui
     c.r[29].sd[0] = static_cast<std::int32_t>(kKernelStackTop - (nested ? 0x4000u : 0u));
     c.r[31].sd[0] = static_cast<std::int32_t>(kHandlerReturn);
     c.pc = address;
-    g_guest_calls.push_back(address);
+    g_guest_calls.push_back({address, kind, number, now(), frame_count()});
+    publish_routine();
     while (!halted()) {
         c.pc &= ~kUnwind;
         if (c.pc == kHandlerReturn) break;
         if (c.budget <= 0) set_budget(c, 20000);
         dispatch(c, 0, 0);
     }
+    // Broken off by a halt after more than a refresh of game time (a routine entered after the halt stops at once and says nothing):
+    // note it for the closing lines, innermost first, with where the code was.
+    if ((c.pc & ~kUnwind) != kHandlerReturn && g_stuck_line.empty() && now() - g_guest_calls.back().cycles >= kEeClock / 50) {
+        const GuestCall &g = g_guest_calls.back();
+        const std::uint64_t cycles = now() - g.cycles;
+        char b[256];
+        std::snprintf(b, sizeof b, " at 0x%08X had not returned when the run ended: running for %llu frames (%.1f s of game time); pc 0x%08X ra 0x%08X",
+                      g.address, static_cast<unsigned long long>(frame_count() - g.frame), static_cast<double>(cycles) / kEeClock, c.pc & ~kUnwind,
+                      c.r[31].w[0]);
+        g_stuck_line = "[ee] stuck in a game routine: the " + routine_words(g.kind, g.number) + b + "\n";
+    }
     g_guest_calls.pop_back();
+    publish_routine();
     const std::uint32_t result = c.r[2].w[0];
     load_context(c, saved);
     c.cop0[12] = status;
@@ -234,12 +292,18 @@ std::uint32_t run_guest(Cpu &c, std::uint32_t address, std::uint32_t a0, std::ui
     return result;
 }
 
+void run_traced(Cpu &c, bool dmac, unsigned cause, const std::vector<Handler> &handlers);
+
 void run_intc(Cpu &c, unsigned cause) {
     hw::intc_ack(cause);
     const std::vector<Handler> handlers = g_intc_handlers;
+    if (g_trace_irq) [[unlikely]] {
+        run_traced(c, false, cause, handlers);
+        return;
+    }
     for (const Handler &h : handlers) {
         if (h.cause != cause) continue;
-        const std::int32_t result = static_cast<std::int32_t>(run_guest(c, h.address, cause, h.arg, 0, h.gp));
+        const std::int32_t result = static_cast<std::int32_t>(run_guest(c, Routine::kIntc, cause, h.address, cause, h.arg, 0, h.gp));
         if (result < 0) break;
     }
 }
@@ -249,9 +313,13 @@ void run_dmac(Cpu &c, unsigned channel) {
     static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
     if (trace) std::fprintf(stderr, "[dmac] interrupt ch%u thread %d\n", channel, g_current);
     const std::vector<Handler> handlers = g_dmac_handlers;
+    if (g_trace_irq) [[unlikely]] {
+        run_traced(c, true, channel, handlers);
+        return;
+    }
     for (const Handler &h : handlers) {
         if (h.cause != channel) continue;
-        const std::int32_t result = static_cast<std::int32_t>(run_guest(c, h.address, channel, h.arg, 0, h.gp));
+        const std::int32_t result = static_cast<std::int32_t>(run_guest(c, Routine::kDmac, channel, h.address, channel, h.arg, 0, h.gp));
         if (trace) std::fprintf(stderr, "[dmac]   handler 0x%08X arg 0x%08X -> %d\n", h.address, h.arg, result);
         if (result < 0) break;
     }
@@ -262,7 +330,130 @@ bool interrupts_enabled() {
     return (status & 0x10001u) == 0x10001u && !(status & 6u);
 }
 
-void add_handler(Cpu &c, std::vector<Handler> &list) {
+// ---- the interrupt trace (PS2_TRACE_INTC) ----
+const char *irq_name(bool dmac, unsigned n) {
+    static const char *const intc[] = {"GS", "SBUS", "VBLANK start", "VBLANK end", "VIF0", "VIF1", "VU0", "VU1", "IPU", "TIMER0", "TIMER1",
+                                       "TIMER2", "TIMER3", "SFIFO", "VU0 watchdog"};
+    static const char *const ch[] = {"VIF0", "VIF1", "GIF", "fromIPU", "toIPU", "SIF0", "SIF1", "SIF2", "fromSPR", "toSPR"};
+    if (dmac) return n < 10 ? ch[n] : n == 13 ? "stall" : n == 14 ? "MFIFO empty" : n == 15 ? "bus error" : "other";
+    return n < 15 ? intc[n] : "other";
+}
+
+std::string irq_bits(bool dmac, std::uint32_t bits) {
+    std::string out;
+    for (unsigned i = 0; i < 16; ++i)
+        if (bits >> i & 1u) {
+            char b[48];
+            std::snprintf(b, sizeof b, "%s%u %s", out.empty() ? "" : ", ", i, irq_name(dmac, i));
+            out += b;
+        }
+    return out.empty() ? "none" : out;
+}
+
+// Said for the first 8 events of a kind, then every 512th: a 20 second run stays a log a tester can attach.
+bool irq_say(std::uint64_t n) { return n <= 8 || n % 512 == 0; }
+
+struct IrqCount {
+    std::uint64_t raised = 0, masked = 0, off = 0, delivered = 0, nohandler = 0;
+};
+struct HandlerStat {
+    std::uint64_t calls = 0, stops = 0;
+    std::uint32_t last = 0;
+    bool any = false;
+};
+IrqCount g_irq_count[2][16];
+// How often the program called Add (index 0/1: INTC/DMAC), Remove (2) and Enable/Disable (3..6) per cause: these lines are bounded like the
+// rest (a game that switches a channel on and off for every transfer made 5400 lines in 25 seconds of God of War II).
+std::uint64_t g_irq_calls[7][16];
+std::map<int, HandlerStat> g_irq_handler;  // by handler id (one numbering for both lists)
+
+unsigned long long irq_frame() { return static_cast<unsigned long long>(frame_count()); }
+
+std::string chain_text(const std::vector<Handler> &list, std::uint32_t cause, bool any_cause = false) {
+    std::string out;
+    for (const Handler &h : list) {
+        if (!any_cause && h.cause != cause) continue;
+        char b[64];
+        if (any_cause) std::snprintf(b, sizeof b, "%sid %d cause %u 0x%08X", out.empty() ? "" : " | ", h.id, h.cause, h.address);
+        else std::snprintf(b, sizeof b, "%sid %d 0x%08X", out.empty() ? "" : " > ", h.id, h.address);
+        out += b;
+    }
+    return out.empty() ? "(empty)" : out;
+}
+
+void run_traced(Cpu &c, bool dmac, unsigned cause, const std::vector<Handler> &handlers) {
+    IrqCount &n = g_irq_count[dmac][cause & 15u];
+    ++n.delivered;
+    const char *kind = dmac ? "DMAC" : "INTC";
+    int total = 0;
+    for (const Handler &h : handlers) total += h.cause == cause;
+    if (!total) {
+        ++n.nohandler;
+        if (irq_say(n.nohandler))
+            std::fprintf(stderr, "[irq] f%llu %s %u (%s): no handler installed for it, acknowledged and dropped (%llu times)\n", irq_frame(), kind, cause,
+                         irq_name(dmac, cause), static_cast<unsigned long long>(n.nohandler));
+        return;
+    }
+    int at = 0;
+    for (const Handler &h : handlers) {
+        if (h.cause != cause) continue;
+        ++at;
+        const std::int32_t result = static_cast<std::int32_t>(run_guest(c, dmac ? Routine::kDmac : Routine::kIntc, cause, h.address, cause, h.arg, 0, h.gp));
+        HandlerStat &st = g_irq_handler[h.id];
+        const bool changed = st.any && st.last != static_cast<std::uint32_t>(result);
+        ++st.calls;
+        st.last = static_cast<std::uint32_t>(result);
+        st.any = true;
+        const bool stop = result < 0;
+        st.stops += stop;
+        if (irq_say(st.calls) || changed) {
+            const char *tail = stop ? (at < total ? "chain stops here, the later handlers do not run" : "negative: would stop the chain (this is the last one)")
+                                    : (at < total ? "chain goes on" : "last in the chain");
+            std::fprintf(stderr, "[irq] f%llu %s %u (%s) handler %d of %d: id %d 0x%08X arg 0x%08X thread %d returned 0x%08X: %s (call %llu%s)\n", irq_frame(),
+                         kind, cause, irq_name(dmac, cause), at, total, h.id, h.address, h.arg, g_current, static_cast<std::uint32_t>(result), tail,
+                         static_cast<unsigned long long>(st.calls), changed ? ", the answer changed" : "");
+        }
+        if (stop) break;
+    }
+}
+
+void trace_add(const std::vector<Handler> &list, const Handler &h, std::int32_t next, bool dmac) {
+    int pos = 0, total = 0;
+    for (const Handler &x : list) {
+        if (x.cause != h.cause) continue;
+        ++total;
+        if (x.id == h.id) pos = total;
+    }
+    if (!irq_say(++g_irq_calls[dmac][h.cause & 15u])) return;
+    const char *where = next == 0 ? "in front of the others" : next == -1 ? "at the end" : "before another handler";
+    std::fprintf(stderr, "[irq] f%llu Add%sHandler: %s %u (%s) handler id %d at 0x%08X arg 0x%08X, %s (next=%d): place %d of %d; chain now: %s\n", irq_frame(),
+                 dmac ? "Dmac" : "Intc", dmac ? "DMAC" : "INTC", h.cause, irq_name(dmac, h.cause), h.id, h.address, h.arg, where, next, pos, total,
+                 chain_text(list, h.cause).c_str());
+}
+
+void trace_remove(const std::vector<Handler> &list, int id, bool found, bool dmac) {
+    if (!irq_say(++g_irq_calls[2][dmac])) return;
+    std::fprintf(stderr, "[irq] f%llu Remove%sHandler: id %d %s\n", irq_frame(), dmac ? "Dmac" : "Intc", id, found ? "removed" : "not found (returns -1)");
+    if (found) std::fprintf(stderr, "[irq]   %s handlers now: %s\n", dmac ? "DMAC" : "INTC", chain_text(list, 0, true).c_str());
+}
+
+// The Enable/Disable system calls of both controllers: the one place that also says what the call did to the mask.
+bool mask_call(bool dmac, unsigned n, bool enable) {
+    const bool changed = dmac ? hw::dmac_set_mask(n, enable) : hw::intc_set_mask(n, enable);
+    if (g_trace_irq) [[unlikely]] {
+        if (!irq_say(++g_irq_calls[3 + dmac * 2 + !enable][n & 15u])) return changed;
+        const auto &list = dmac ? g_dmac_handlers : g_intc_handlers;
+        int have = 0;
+        for (const Handler &h : list) have += h.cause == n;
+        const std::uint32_t mask = dmac ? (hw::dmac_stat_raw() >> 16) & 0x3FFu : hw::intc_mask_raw();
+        std::fprintf(stderr, "[irq] f%llu %s%s(%u %s): %s; mask now 0x%04X, %d handler%s for it%s\n", irq_frame(), enable ? "Enable" : "Disable", dmac ? "Dmac" : "Intc", n,
+                     irq_name(dmac, n), changed ? (enable ? "was off, now on" : "was on, now off") : (enable ? "was already on" : "was already off"), mask, have,
+                     have == 1 ? "" : "s", enable && !have ? " (nothing will run when it fires)" : "");
+    }
+    return changed;
+}
+
+void add_handler(Cpu &c, std::vector<Handler> &list, bool dmac) {
     Handler h{g_next_handler++, arg(c, 0), arg(c, 1), arg(c, 3), c.r[28].w[0]};
     const auto next = static_cast<std::int32_t>(arg(c, 2));
     if (next == 0) list.insert(list.begin(), h);
@@ -271,14 +462,16 @@ void add_handler(Cpu &c, std::vector<Handler> &list) {
         auto it = std::find_if(list.begin(), list.end(), [&](const Handler &x) { return x.id == next; });
         list.insert(it, h);
     }
+    if (g_trace_irq) [[unlikely]] trace_add(list, h, next, dmac);
     ret(c, h.id);
 }
 
-void remove_handler(Cpu &c, std::vector<Handler> &list) {
+void remove_handler(Cpu &c, std::vector<Handler> &list, bool dmac) {
     const int id = static_cast<int>(arg(c, 1));
     const auto end = std::remove_if(list.begin(), list.end(), [&](const Handler &h) { return h.id == id; });
     const bool found = end != list.end();
     list.erase(end, list.end());
+    if (g_trace_irq) [[unlikely]] trace_remove(list, id, found, dmac);
     // The console returns the handler id when it removed a handler and a negative number when there was none. Silent Hill 2's
     // film player depends on it: it re-enables the vertical blank interrupt only when the removal returned non-zero.
     ret(c, found ? id : -1);
@@ -302,7 +495,7 @@ void run_alarms(Cpu &c) {
         if (it == g_alarms.end()) continue;
         const Alarm alarm = it->second;
         g_alarms.erase(it);
-        run_guest(c, alarm.callback, static_cast<std::uint32_t>(id), static_cast<std::uint32_t>(now() / hblank_cycles()), alarm.arg, alarm.gp);
+        run_guest(c, Routine::kAlarm, static_cast<std::uint32_t>(id), alarm.callback, static_cast<std::uint32_t>(id), static_cast<std::uint32_t>(now() / hblank_cycles()), alarm.arg, alarm.gp);
         g_reschedule = true;
     }
 }
@@ -420,7 +613,7 @@ void wait_sema(Cpu &c, int id) {
         return;
     }
     if (g_in_handler) {
-        std::fprintf(stderr, "[kernel] WaitSema(%d) inside an interrupt handler (ra 0x%08X, thread %d, handler 0x%08X)\n", id, c.r[31].w[0], g_current, g_guest_calls.empty() ? 0u : g_guest_calls.back());
+        std::fprintf(stderr, "[kernel] WaitSema(%d) inside an interrupt handler (ra 0x%08X, thread %d, handler 0x%08X)\n", id, c.r[31].w[0], g_current, g_guest_calls.empty() ? 0u : g_guest_calls.back().address);
         return;
     }
     s.waiters.push_back(g_current);
@@ -437,6 +630,10 @@ void reset() {
     index_semas();
     g_intc_handlers.clear();
     g_dmac_handlers.clear();
+    g_irq_handler.clear();
+    std::memset(g_irq_calls, 0, sizeof g_irq_calls);
+    for (auto &row : g_irq_count)
+        for (IrqCount &n : row) n = IrqCount{};
     g_alarms.clear();
     g_current = 0;
     g_next_handler = 1;
@@ -662,6 +859,8 @@ static std::string state_words(const Thread &t) {
 }
 
 void dump() {
+    if (!g_stuck_line.empty()) std::fputs(g_stuck_line.c_str(), stderr);  // a game routine the halt broke out of
+    if (g_trace_irq) std::fputs(interrupt_report("[irq] ").c_str(), stderr);  // PS2_TRACE_INTC: the interrupt side at the end of the run
     for (const auto &[id, t] : g_threads) {
         std::fprintf(stderr, "[thread] %d status %d prio %d wait %d/%d pc 0x%08X ra 0x%08X (%s)\n", id, t.status, t.priority, t.wait, t.wait_id,
                      id == g_current ? g_cpu.pc : t.context.pc, id == g_current ? g_cpu.r[31].w[0] : t.context.r[31].w[0], state_words(t).c_str());
@@ -701,6 +900,138 @@ std::string thread_summary() {
     return std::to_string(live - waiting) + " of " + std::to_string(live) + " EE threads run or are ready, " + std::to_string(waiting) + " wait";
 }
 
+// A cause (INTC) or channel (DMAC) fired, called from hw.cpp right after the status bit is set: what becomes of it (PS2_TRACE_INTC).
+void trace_raise(bool dmac, unsigned cause) {
+    IrqCount &n = g_irq_count[dmac][cause & 15u];
+    ++n.raised;
+    const bool unmasked = dmac ? ((hw::dmac_stat_raw() >> (16 + cause)) & 1u) != 0 : ((hw::intc_mask_raw() >> cause) & 1u) != 0;
+    const auto &list = dmac ? g_dmac_handlers : g_intc_handlers;
+    int have = 0;
+    for (const Handler &h : list) have += h.cause == cause;
+    const char *why;
+    bool say;
+    if (!unmasked) {
+        ++n.masked;
+        say = irq_say(n.masked);
+        why = "masked: its mask bit is off, so it waits in the status register until it is enabled";
+    } else if (!interrupts_enabled()) {
+        ++n.off;
+        say = irq_say(n.off);
+        why = "interrupts are off in the Status register (IE/EIE/EXL/ERL), so it waits until they are on";
+    } else {
+        say = irq_say(n.raised);
+        why = g_in_handler ? "a handler is running, so it is taken right after it"
+                           : have ? "enabled and interrupts are on: taken at the next safe point" : "enabled, but no handler is installed for it: it will be dropped";
+    }
+    if (say)
+        std::fprintf(stderr, "[irq] f%llu %s %u (%s) fires (%llu): %s [Status 0x%08X, %d handler%s]\n", irq_frame(), dmac ? "DMAC" : "INTC", cause, irq_name(dmac, cause),
+                     static_cast<unsigned long long>(n.raised), why, g_cpu.cop0[12], have, have == 1 ? "" : "s");
+}
+
+// A direct write to INTC_STAT (reg 0, ones clear), INTC_MASK (reg 1, ones toggle) or D_STAT (reg 2, low half clears, high half toggles).
+void trace_register_write(int reg, std::uint32_t value, std::uint32_t before, std::uint32_t after) {
+    static std::uint64_t seen[3];
+    const bool dmac = reg == 2;
+    const std::uint32_t low_before = before & 0xFFFFu, low_after = after & 0xFFFFu;
+    const std::uint32_t cleared = reg == 1 ? 0u : low_before & ~low_after;
+    const std::uint32_t on = reg == 1 ? after & ~before : (reg == 2 ? ((after & ~before) >> 16) & 0xFFFFu : 0u);
+    const std::uint32_t off = reg == 1 ? before & ~after : (reg == 2 ? ((before & ~after) >> 16) & 0xFFFFu : 0u);
+    if (!cleared && !on && !off) return;
+    if (!irq_say(++seen[reg])) return;
+    static const char *const names[] = {"INTC_STAT", "INTC_MASK", "D_STAT"};
+    std::fprintf(stderr, "[irq] f%llu direct write %s 0x%08X by the program (thread %d):", irq_frame(), names[reg], value, g_current);
+    if (cleared) std::fprintf(stderr, " acknowledged %s;", irq_bits(dmac, cleared).c_str());
+    if (on) std::fprintf(stderr, " turned on %s;", irq_bits(dmac, on).c_str());
+    if (off) std::fprintf(stderr, " turned off %s;", irq_bits(dmac, off).c_str());
+    std::fprintf(stderr, "\n");
+}
+
+static std::string handler_lines(const std::vector<Handler> &list, bool dmac, const char *prefix) {
+    std::string out;
+    char b[300];
+    std::vector<std::uint32_t> seen;
+    for (const Handler &first : list) {
+        if (std::find(seen.begin(), seen.end(), first.cause) != seen.end()) continue;
+        seen.push_back(first.cause);
+        std::snprintf(b, sizeof b, "%s%s %u (%s), in the order they run:", prefix, dmac ? "DMAC" : "INTC", first.cause, irq_name(dmac, first.cause));
+        out += b;
+        for (const Handler &h : list) {
+            if (h.cause != first.cause) continue;
+            std::snprintf(b, sizeof b, " [id %d 0x%08X arg 0x%08X", h.id, h.address, h.arg);
+            out += b;
+            const auto it = g_irq_handler.find(h.id);
+            if (it != g_irq_handler.end())
+                std::snprintf(b, sizeof b, ", ran %llu times, last answer 0x%08X, %llu times negative]", static_cast<unsigned long long>(it->second.calls), it->second.last,
+                              static_cast<unsigned long long>(it->second.stops));
+            else
+                std::snprintf(b, sizeof b, "%s]", g_trace_irq ? ", never ran" : "");
+            out += b;
+        }
+        out += "\n";
+    }
+    if (out.empty()) out = std::string(prefix) + (dmac ? "DMAC" : "INTC") + ": no handler installed\n";
+    return out;
+}
+
+std::string routine_report(const char *prefix) {
+    const std::uint32_t live = g_live_routine.load(std::memory_order_relaxed);
+    if (!live) return {};
+    const std::uint64_t since = g_live_frame.load(std::memory_order_relaxed), frames = frame_count();
+    // Read while the emulation may be running: one word each, a hint of where the code is, not an exact place.
+    const std::uint32_t pc = std::atomic_ref<std::uint32_t>(g_cpu.pc).load(std::memory_order_relaxed) & ~kUnwind;
+    const std::uint32_t ra = std::atomic_ref<std::uint32_t>(g_cpu.r[31].w[0]).load(std::memory_order_relaxed);
+    char b[256];
+    std::snprintf(b, sizeof b, " at 0x%08X is running since frame %llu (%llu frames ago); pc 0x%08X ra 0x%08X\n",
+                  g_live_address.load(std::memory_order_relaxed), static_cast<unsigned long long>(since),
+                  static_cast<unsigned long long>(frames >= since ? frames - since : 0), pc, ra);
+    return std::string(prefix) + "the EE is inside a game routine: the " + routine_words(static_cast<Routine>(live >> 24), live & 0xFFFFFFu) + b;
+}
+
+std::string interrupt_report(const char *prefix) {
+    std::string out;
+    char b[400];
+    const std::uint32_t status = g_cpu.cop0[12];
+    const bool on = interrupts_enabled();
+    std::snprintf(b, sizeof b, "%sEE interrupts are %s: Status 0x%08X (IE %u, EIE %u, EXL %u, ERL %u)%s\n", prefix, on ? "ON" : "OFF", status, status & 1u, (status >> 16) & 1u,
+                  (status >> 1) & 1u, (status >> 2) & 1u, g_in_handler ? "; a handler is running right now" : "");
+    out += b;
+    if (!on) {
+        out += std::string(prefix) + "  off because:" + ((status & 1u) ? "" : " IE is 0 (DI)") + (((status >> 16) & 1u) ? "" : " EIE is 0") +
+               ((status & 2u) ? " EXL is set" : "") + ((status & 4u) ? " ERL is set" : "") + "\n";
+    }
+    const std::uint32_t im = hw::intc_mask_raw(), is = hw::intc_stat_raw();
+    std::snprintf(b, sizeof b, "%sINTC_MASK 0x%04X (on: %s)\n%sINTC_STAT 0x%04X (set: %s); waiting to run: %s; set but masked: %s\n", prefix, im, irq_bits(false, im).c_str(), prefix,
+                  is, irq_bits(false, is).c_str(), irq_bits(false, is & im).c_str(), irq_bits(false, is & ~im).c_str());
+    out += b;
+    const std::uint32_t ds = hw::dmac_stat_raw(), dis = ds & 0xFFFFu, dim = (ds >> 16) & 0xFFFFu;
+    std::snprintf(b, sizeof b, "%sD_STAT 0x%08X: mask (on: %s); status (set: %s); waiting to run: %s; set but masked: %s\n", prefix, ds, irq_bits(true, dim).c_str(),
+                  irq_bits(true, dis).c_str(), irq_bits(true, dis & dim).c_str(), irq_bits(true, dis & ~dim).c_str());
+    out += b;
+    out += handler_lines(g_intc_handlers, false, prefix);
+    out += handler_lines(g_dmac_handlers, true, prefix);
+    if (!g_trace_irq) {
+        out += std::string(prefix) + "(how often each fired, why it did not run, every handler call: start the runner with PS2_TRACE_INTC=1)\n";
+        return out;
+    }
+    std::uint64_t sums[7] = {};
+    for (int k = 0; k < 7; ++k)
+        for (std::uint64_t v : g_irq_calls[k]) sums[k] += v;
+    std::snprintf(b, sizeof b, "%scalls the program made: AddIntcHandler %llu, AddDmacHandler %llu, Remove...Handler %llu, Enable/DisableIntc %llu, Enable/DisableDmac %llu\n", prefix,
+                  static_cast<unsigned long long>(sums[0]), static_cast<unsigned long long>(sums[1]), static_cast<unsigned long long>(sums[2]),
+                  static_cast<unsigned long long>(sums[3] + sums[4]), static_cast<unsigned long long>(sums[5] + sums[6]));
+    out += b;
+    for (int d = 0; d < 2; ++d)
+        for (unsigned i = 0; i < 16; ++i) {
+            const IrqCount &n = g_irq_count[d][i];
+            if (!n.raised && !n.delivered) continue;
+            std::snprintf(b, sizeof b, "%s%s %u (%s): fired %llu times (%llu while masked, %llu while interrupts were off), delivered %llu, %llu with no handler\n", prefix,
+                          d ? "DMAC" : "INTC", i, irq_name(d != 0, i), static_cast<unsigned long long>(n.raised), static_cast<unsigned long long>(n.masked),
+                          static_cast<unsigned long long>(n.off), static_cast<unsigned long long>(n.delivered), static_cast<unsigned long long>(n.nohandler));
+            out += b;
+        }
+    return out;
+}
+
 std::string thread_report() {
     std::string out;
     char b[200];
@@ -729,7 +1060,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     if (n < 0x100u) {
         const std::uint32_t custom = ld32(kSyscallTable + n * 4u);
         if (custom && has_code(custom & 0x1FFFFFFFu)) {
-            const std::uint32_t result = run_guest(c, custom & 0x1FFFFFFFu, arg(c, 0), arg(c, 1), arg(c, 2), c.r[28].w[0], arg(c, 3));
+            const std::uint32_t result = run_guest(c, Routine::kSyscall, n, custom & 0x1FFFFFFFu, arg(c, 0), arg(c, 1), arg(c, 2), c.r[28].w[0], arg(c, 3));
             ret(c, static_cast<std::int32_t>(result));
             return;
         }
@@ -754,14 +1085,14 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     case 0x02: hw::gs_set_crt(arg(c, 0), arg(c, 1), arg(c, 2)); ret(c, 0); break;
     case 0x04: halt("Exit"); break;
     case 0x06: case 0x07: halt("program asked to run another executable"); break;
-    case 0x10: add_handler(c, g_intc_handlers); break;
-    case 0x11: remove_handler(c, g_intc_handlers); break;
-    case 0x12: add_handler(c, g_dmac_handlers); break;
-    case 0x13: remove_handler(c, g_dmac_handlers); break;
-    case 0x14: case 0x1A: ret(c, hw::intc_set_mask(arg(c, 0), true) ? 1 : 0); break;
-    case 0x15: case 0x1B: ret(c, hw::intc_set_mask(arg(c, 0), false) ? 1 : 0); break;
-    case 0x16: case 0x1C: ret(c, hw::dmac_set_mask(arg(c, 0), true) ? 1 : 0); break;
-    case 0x17: case 0x1D: ret(c, hw::dmac_set_mask(arg(c, 0), false) ? 1 : 0); break;
+    case 0x10: add_handler(c, g_intc_handlers, false); break;
+    case 0x11: remove_handler(c, g_intc_handlers, false); break;
+    case 0x12: add_handler(c, g_dmac_handlers, true); break;
+    case 0x13: remove_handler(c, g_dmac_handlers, true); break;
+    case 0x14: case 0x1A: ret(c, mask_call(false, arg(c, 0), true) ? 1 : 0); break;
+    case 0x15: case 0x1B: ret(c, mask_call(false, arg(c, 0), false) ? 1 : 0); break;
+    case 0x16: case 0x1C: ret(c, mask_call(true, arg(c, 0), true) ? 1 : 0); break;
+    case 0x17: case 0x1D: ret(c, mask_call(true, arg(c, 0), false) ? 1 : 0); break;
     case 0x18: case 0x1E: case 0xFC: case 0xFE: {
         const int id = lowest_free(g_alarms, 64);
         if (id < 0) { ret(c, -1); break; }
