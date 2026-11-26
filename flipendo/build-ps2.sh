@@ -54,10 +54,10 @@ fi
 RB="$PS2RECOMP/build/android-ps2"
 "$CM/cmake.exe" -S "$PS2RECOMP" -B "$RB" -G Ninja -DCMAKE_MAKE_PROGRAM="$CM/ninja.exe" \
 	-DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
-	-DCMAKE_BUILD_TYPE=Release -DPS2_GENERATED="$(cygpath -m "$PS2RECOMP/host/empty_game")" \
+	-DCMAKE_BUILD_TYPE=Release -DCMAKE_SHARED_LINKER_FLAGS=-flto=thin -DPS2_GENERATED="$(cygpath -m "$PS2RECOMP/host/empty_game")" \
 	-DPS2_WGPU_DIR="$(cygpath -m "$PS2RECOMP/third_party/wgpu-native-android")" \
 	-DSDL2_DIR="$(cygpath -m "$DEPS/sdl2-compat-install/lib/cmake/SDL2")" -DPS2_ANDROID_LIB_NAME=ps2main \
-	"-DCMAKE_CXX_FLAGS=-DPS2_JNI_TOUCH=io_github_flipendo_spike_Ps2Pad -DPS2_JNI_ACTIVITY=io_github_flipendo_spike_Ps2Activity"
+	"-DCMAKE_CXX_FLAGS=-flto=thin -DPS2_JNI_TOUCH=io_github_flipendo_spike_Ps2Pad -DPS2_JNI_ACTIVITY=io_github_flipendo_spike_Ps2Activity"
 "$CM/ninja.exe" -C "$RB" -j"$JOBS" ps2run
 STRIP="$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip.exe"
 cp "$RB/libps2main.so" "$OUT/libps2main.so"

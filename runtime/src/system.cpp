@@ -1394,39 +1394,70 @@ void enter_thread(Thread thread) {
     pthread_setname_np(info.system);  // macOS names only the calling thread
 #endif
 #if defined(__ANDROID__)
-    // Phones may leave the heavy threads on the little cores: keep them on the cores whose top frequency is within 10 % of the fastest
-    // one. Scheduling only, no effect on results. PS2_NO_PIN=1 turns it off.
+    // Phones may leave the heavy threads on the little cores. The big cores are those within 10 % of the strongest one, by the kernel's
+    // cpu_capacity (it knows the core type: on a Helio G85 the little A55s run at 1.8 GHz against the big A75s' 2.0 GHz, so the top
+    // frequencies alone call all eight cores alike), else by the top frequency. With four or more big cores the four heavy threads share
+    // them. With fewer (2 + 6 phones), the game and vector unit threads get a big core each, the drawing and tile threads the cores left
+    // over: four busy threads on two cores would take turns. Scheduling only, no effect on results. PS2_NO_PIN=1 turns it off.
     if (thread == Thread::Game || thread == Thread::VectorUnit || thread == Thread::Gpu || thread == Thread::Tiles) {
-        static const cpu_set_t big = [] {
-            cpu_set_t set;
-            CPU_ZERO(&set);
-            long freq[64] = {};
-            long best = 0;
-            const int n = static_cast<int>(sysconf(_SC_NPROCESSORS_CONF));
-            for (int i = 0; i < n && i < 64; ++i) {
-                char path[96];
-                std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
-                if (FILE *f = std::fopen(path, "r")) {
-                    if (std::fscanf(f, "%ld", &freq[i]) != 1) freq[i] = 0;
-                    std::fclose(f);
+        struct Cores {
+            cpu_set_t big, rest;
+            int big_list[64];
+            int big_count = 0;
+        };
+        static const Cores cores = [] {
+            Cores c;
+            CPU_ZERO(&c.big);
+            CPU_ZERO(&c.rest);
+            const int n = std::min(64, static_cast<int>(sysconf(_SC_NPROCESSORS_CONF)));
+            const auto read_all = [n](const char *name, long (&into)[64]) {
+                long best = 0;
+                for (int i = 0; i < n; ++i) {
+                    char path[96];
+                    std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/%s", i, name);
+                    into[i] = 0;
+                    if (FILE *f = std::fopen(path, "r")) {
+                        if (std::fscanf(f, "%ld", &into[i]) != 1) into[i] = 0;
+                        std::fclose(f);
+                    }
+                    best = std::max(best, into[i]);
                 }
-                best = std::max(best, freq[i]);
+                return best;
+            };
+            long score[64];
+            long best = read_all("cpu_capacity", score);
+            const char *by = "capacity";
+            if (best <= 0) best = read_all("cpufreq/cpuinfo_max_freq", score), by = "top frequency";
+            if (best <= 0) return c;  // unknown: leave the scheduler alone
+            for (int i = 0; i < n; ++i) {
+                if (score[i] * 10 >= best * 9) {
+                    CPU_SET(i, &c.big);
+                    c.big_list[c.big_count++] = i;
+                } else {
+                    CPU_SET(i, &c.rest);
+                }
             }
-            int count = 0;
-            if (best > 0)
-                for (int i = 0; i < n && i < 64; ++i)
-                    if (freq[i] * 10 >= best * 9) { CPU_SET(i, &set); ++count; }
-            if (count == 0 || count == n) CPU_ZERO(&set);  // unknown or all alike: leave the scheduler alone
-            return set;
+            if (c.big_count == n) CPU_ZERO(&c.big), c.big_count = 0;  // all alike: nothing to choose
+            std::fprintf(stderr, "[cores] %d big of %d by %s%s\n", c.big_count, n, by,
+                         c.big_count == 0 ? ", left to the system" : c.big_count >= 4 ? ", shared by the heavy threads" : ", game and vector unit one each");
+            return c;
         }();
-        // PS2_PIN=g,v,r,t: one processor each for the game (emulation), vector unit, drawing and tile threads ('-' keeps the group above for that
+        // PS2_PIN=g,v,r,t: one processor each for the game (emulation), vector unit, drawing and tile threads ('-' keeps the choice above for that
         // thread): a heavy thread alone on a core keeps that core's clock up (a core shared by several threads is seen as lightly loaded between
         // their bursts and slows down). PS2_NO_PIN=1 leaves all of it to the system.
-        cpu_set_t mine = big;
+        const int slot = thread == Thread::Game ? 0 : thread == Thread::VectorUnit ? 1 : thread == Thread::Gpu ? 2 : 3;
+        cpu_set_t mine = cores.big;
+        if (cores.big_count > 0 && cores.big_count < 4) {
+            if (slot < 2 && slot < cores.big_count) {
+                CPU_ZERO(&mine);
+                CPU_SET(cores.big_list[slot], &mine);
+            } else {
+                mine = cores.rest;
+            }
+        }
         if (const char *pin = std::getenv("PS2_PIN")) {
-            const int index = thread == Thread::Game ? 0 : thread == Thread::VectorUnit ? 1 : thread == Thread::Gpu ? 2 : 3;
             const char *p = pin;
-            for (int i = 0; i < index && p; ++i) {
+            for (int i = 0; i < slot && p; ++i) {
                 p = std::strchr(p, ',');
                 if (p) ++p;
             }
