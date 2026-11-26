@@ -46,6 +46,9 @@
 #include <fstream>
 #include <cstdlib>
 #include <filesystem>
+#if defined(__SSE2__)
+#include <xmmintrin.h>  // _mm_setcsr: the fast vector unit's flush-to-zero (run_vu_thread)
+#endif
 #include <iterator>
 #include <mutex>
 #include <stdexcept>
@@ -1044,6 +1047,19 @@ void run_vu_thread() {
     gs::queue::Ring &in = gs::queue::vu();
     crash::enter_thread(crash::Thread::VectorUnit);
     thread_tune(Who::Vu);
+    // The fast vector unit (ps2/vu_ops.hpp, PS2_VU_FAST): flush-to-zero for the whole of this thread, set before any program runs, so
+    // that a compiled program never writes the control register (two writes per call cost more than a short program's own work). The
+    // interpreter, VIF unpacking and GIF parsing on this thread do integer work or clean their numbers themselves.
+    if (vu::fast_mode()) {
+#if defined(__aarch64__)
+        std::uint64_t fpcr;
+        __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+        __asm__ volatile("msr fpcr, %0" : : "r"(fpcr | (1ull << 24)));
+#elif defined(__SSE2__)
+        _mm_setcsr(_mm_getcsr() | 0x8040u);
+#endif
+        std::fprintf(stderr, "[vu] fast vector unit: flush-to-zero on the vector-unit thread, compiled programs cleaned the cheap way (PS2_VU_FAST=0: exact)\n");
+    }
     // PS2_VU_SPIN=<microseconds>: look for new work this long before going to sleep (a sleep and a wake-up cost a system call each)
     static const long spin_us = std::atol(os::env("PS2_VU_SPIN").c_str());
     // What this thread hands to the drawing thread goes in batches: the packets of the vector programs and of

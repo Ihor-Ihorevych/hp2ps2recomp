@@ -4,8 +4,25 @@
 #include "fpu.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace ps2::vu {
+
+// The fast vector unit (vu_ops.hpp, PS2_VU_FAST): compiled VU1 programs clean their numbers the cheap way, with flush-to-zero, which is not
+// bit-exact with the console (results just below the smallest normal float become zero) and never shows. PS2_VU_FAST=1 / 0, else
+// PS2_FAST=1 / 0 (every fast path at once), else on for ARM, where the exact way costs most, and off elsewhere.
+inline bool fast_mode() {
+    static const bool on = [] {
+        for (const char *name : {"PS2_VU_FAST", "PS2_FAST"})
+            if (const char *v = std::getenv(name); v && *v) return *v != '0';
+#if defined(__aarch64__)
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return on;
+}
 
 inline bool lane(unsigned dest, int i) { return dest & (8u >> i); }
 

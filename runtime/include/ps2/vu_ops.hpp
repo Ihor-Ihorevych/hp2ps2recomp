@@ -1368,10 +1368,24 @@ inline void efu(Vu0Regs &r, unsigned index, unsigned fs, unsigned fsf) {
 //    every value that becomes an operand goes through vopaque (no instruction, but the compiler no longer knows the value), except the
 //    constant vf00 and what comes from it alone (whole numbers) and the I register after a full vfix.
 // Without SSE4.1 (and on other processors) nothing changes: the helpers below are the old eager ones and vflush does nothing.
+//
+// PS2_VU_FAST (defined for the libraries vu_live.cpp builds when ps2::vu::fast_mode() is on; the default on ARM): the same late clean-up on
+// ARM, with the flush-to-zero bit of FPCR in the place of DAZ, and on x86 with flush-to-zero (FTZ) added to DAZ. Flush-to-zero also
+// flushes results, so no result is ever a denormal and vflush has nothing left to do. It is not exact: a product or sum just below the
+// smallest normal number becomes zero where the console rounds it up to that number (flush-to-zero decides "too small" before rounding).
+// That is the one difference, and it never shows in a picture. The vector-unit thread runs with the bit set all the time
+// (fast_thread_setup), so a program call writes no control register at all.
 #if defined(__SSE4_1__) && !defined(PS2_VU_NO_DAZ)
+#define PS2_VU_DAZ 1
+#elif defined(__aarch64__) && defined(PS2_VU_FAST)
 #define PS2_VU_DAZ 1
 #else
 #define PS2_VU_DAZ 0
+#endif
+#if PS2_VU_DAZ && defined(PS2_VU_FAST)
+#define PS2_VU_FTZ 1
+#else
+#define PS2_VU_FTZ 0
 #endif
 
 inline constexpr std::uint32_t kNoHop = 0xFFFFFFFFu;
@@ -1382,7 +1396,29 @@ PS2_VU_INLINE void vhop(std::uint32_t &hop, std::uint32_t pc) { hop = pc; }
 
 #if PS2_VU_DAZ
 #define PS2_VU_BODY static __attribute__((noinline))
-inline constexpr unsigned kMxcsrDaz = 0x0040u;
+#if defined(__aarch64__)
+// FPCR.FZ (bit 24): denormal operands and results are zeros with their sign. FPCR has no status bits (they are in FPSR).
+inline constexpr unsigned kVuCsrOn = 1u << 24;
+inline constexpr unsigned kVuCsrStatus = 0u;
+PS2_VU_INLINE unsigned vcsr_read() {
+    std::uint64_t v;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(v));
+    return static_cast<unsigned>(v);
+}
+PS2_VU_INLINE void vcsr_write(unsigned v) { __asm__ volatile("msr fpcr, %0" : : "r"(static_cast<std::uint64_t>(v))); }
+PS2_VU_INLINE v4u vopaque(v4u x) {
+    __asm__("" : "+w"(x));
+    return x;
+}
+PS2_VU_INLINE v4u vclamp(v4u x) {
+    return (v4u)vminq_s32(vreinterpretq_s32_u32(vminq_u32((uint32x4_t)x, vdupq_n_u32(0xFF7FFFFFu))), vdupq_n_s32(0x7F7FFFFF));
+}
+#else
+// MXCSR.DAZ (bit 6), and with PS2_VU_FAST FTZ (bit 15) too
+inline constexpr unsigned kVuCsrOn = PS2_VU_FTZ ? 0x8040u : 0x0040u;
+inline constexpr unsigned kVuCsrStatus = 0x003Fu;
+PS2_VU_INLINE unsigned vcsr_read() { return _mm_getcsr(); }
+PS2_VU_INLINE void vcsr_write(unsigned v) { _mm_setcsr(v); }
 PS2_VU_INLINE v4u vopaque(v4u x) {
     __m128i t = (__m128i)x;
     __asm__("" : "+x"(t));
@@ -1394,6 +1430,7 @@ PS2_VU_INLINE v4u vopaque(v4u x) {
 PS2_VU_INLINE v4u vclamp(v4u x) {
     return (v4u)_mm_min_epi32(_mm_min_epu32((__m128i)x, _mm_set1_epi32(static_cast<int>(0xFF7FFFFFu))), _mm_set1_epi32(0x7F7FFFFF));
 }
+#endif
 // The same for the result of an add, subtract or multiply, done with float instructions (MINPS, MAXPS), so that a result on its way
 // from one float instruction to the next does not go through the integer side of the processor and back (a cycle each way on
 // today's processors; measured on a Zen 3, a multiply-add chain takes 9.1 instead of 13.0 ticks per step). Such a result is never
@@ -1405,8 +1442,20 @@ PS2_VU_INLINE v4u vclamp(v4u x) {
 // bit set (tests/test_vu_cleanup.cpp). Never for a value loaded from a register or from memory: that may be a NaN, which MINPS
 // would turn into the positive limit whatever its sign.
 PS2_VU_INLINE v4u vclamp_result(v4f x) {
+#if defined(__aarch64__)
+    // (FMIN and FMAX give a NaN for a NaN operand where MINPS gives the second one, but this value is never a NaN, as said above)
+    return (v4u)vmaxq_f32(vminq_f32((float32x4_t)x, vreinterpretq_f32_u32(vdupq_n_u32(0x7F7FFFFFu))), vreinterpretq_f32_u32(vdupq_n_u32(0xFF7FFFFFu)));
+#else
     return (v4u)_mm_max_ps(_mm_min_ps((__m128)x, _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF))), _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0xFF7FFFFFu))));
+#endif
 }
+#if PS2_VU_FTZ
+// Flush-to-zero leaves no denormal in any result: nothing to flush.
+PS2_VU_INLINE v4u vflush_value(v4u x, v4u) { return x; }
+PS2_VU_INLINE void vflush(Reg128 &, v4u) {}
+PS2_VU_INLINE v4u vflush_mul_value(v4u x, v4u) { return x; }
+PS2_VU_INLINE void vflushd(Reg128 &, v4u) {}
+#else
 // The second half, for the lanes in `lanes` (all bits of a lane set): exponent 0 becomes a zero with its sign.
 PS2_VU_INLINE v4u vflush_value(v4u x, v4u lanes) {
     const __m128i xi = (__m128i)x;
@@ -1422,6 +1471,7 @@ PS2_VU_INLINE void vflush(Reg128 &r, v4u lanes) { vstore(r, vflush_value(vload(r
 // with the bit set (tests/test_vu_cleanup.cpp).
 PS2_VU_INLINE v4u vflush_mul_value(v4u x, v4u lanes) { return vsel(x, (v4u)((v4f)x * (v4f)vopaque(vsplat(0x3F800000u))), lanes); }
 PS2_VU_INLINE void vflushd(Reg128 &r, v4u lanes) { vstore(r, vflush_mul_value(vload(r), lanes)); }
+#endif
 PS2_VU_INLINE v4u vshadow(const Reg128 &r) { return vopaque(vclamp(vload(r))); }
 PS2_VU_INLINE v4u vqd(std::uint32_t q) { return vopaque(vclamp(vsplat(q))); }
 PS2_VU_INLINE v4u vaddd(v4u a, v4u b) { return vopaque(vclamp_result((v4f)a + (v4f)b)); }
@@ -1437,39 +1487,50 @@ PS2_VU_INLINE v4u vmsubd(v4u acc, v4u a, v4u b) { return vsubd(acc, vclamp_resul
 // as it found them, so on one thread they are the same at every call unless some code switches the float mode of the thread for good,
 // and nothing in the runtime touches MXCSR. Builds with assertions check it at every call. The six status bits are free for any
 // function to change, so putting old ones back is allowed. (A value of 0, every float exception switched on, is read every time.)
-inline constexpr unsigned kMxcsrStatus = 0x003Fu;
+// (On ARM the same for FPCR, whose default 0 is read every time; with PS2_VU_FAST the vector-unit thread has FZ set, so it is kept.)
 inline thread_local unsigned t_vu_csr = 0;
 PS2_VU_INLINE unsigned vcsr() {
-    if (t_vu_csr == 0) [[unlikely]] t_vu_csr = _mm_getcsr();
-    assert((_mm_getcsr() | kMxcsrStatus) == (t_vu_csr | kMxcsrStatus));
+    if (t_vu_csr == 0) [[unlikely]] t_vu_csr = vcsr_read();
+    assert((vcsr_read() | kVuCsrStatus) == (t_vu_csr | kVuCsrStatus));
     return t_vu_csr;
 }
+// The caller's control bits already have what the body needs (the vector-unit thread in fast mode): then nothing is written at all.
+PS2_VU_INLINE bool vcsr_ready(unsigned csr) { return (csr & kVuCsrOn) == kVuCsrOn; }
 struct VuDaz {
     unsigned csr;
-    bool on = true;  // false once the body has put MXCSR back itself (vkick_last)
-    VuDaz() : csr(vcsr()) { _mm_setcsr(csr | kMxcsrDaz); }
+    bool on = true;  // false once the body has put MXCSR back itself (vkick_last), or when it never had to change it
+    VuDaz() : csr(vcsr()) {
+        if (vcsr_ready(csr)) on = false;
+        else vcsr_write(csr | kVuCsrOn);
+    }
     ~VuDaz() {
-        if (on) _mm_setcsr(csr);
+        if (on) vcsr_write(csr);
+    }
+    // the program goes round once more (a hop to its own start): the bits again, if a vkick_last gave them back
+    void again() {
+        if (!on && !vcsr_ready(csr)) vcsr_write(csr | kVuCsrOn), on = true;
     }
     VuDaz(const VuDaz &) = delete;
     VuDaz &operator=(const VuDaz &) = delete;
 };
 inline __attribute__((noinline)) void vkick(unsigned csr, int unit, std::uint32_t address) {
-    _mm_setcsr(csr);
+    if (vcsr_ready(csr)) return vu::kick(unit, address);
+    vcsr_write(csr);
     vu::kick(unit, address);
-    _mm_setcsr(csr | kMxcsrDaz);
+    vcsr_write(csr | kVuCsrOn);
 }
 // The last XGKICK of a run: no add, subtract or multiply follows it on any path (the generator says so), so MXCSR stays as the caller
 // has it for the rest of the body.
 inline __attribute__((noinline)) void vkick_last(VuDaz &daz, int unit, std::uint32_t address) {
-    _mm_setcsr(daz.csr);
+    if (daz.on) vcsr_write(daz.csr);
     daz.on = false;
     vu::kick(unit, address);
 }
 inline __attribute__((noinline)) void vefu(unsigned csr, Vu0Regs &r, unsigned index, unsigned fs, unsigned fsf) {
-    _mm_setcsr(csr);
+    if (vcsr_ready(csr)) return efu(r, index, fs, fsf);
+    vcsr_write(csr);
     efu(r, index, fs, fsf);
-    _mm_setcsr(csr | kMxcsrDaz);
+    vcsr_write(csr | kVuCsrOn);
 }
 #else
 #define PS2_VU_BODY static inline __attribute__((always_inline))
@@ -1489,6 +1550,7 @@ PS2_VU_INLINE v4u vmaddd(v4u acc, v4u a, v4u b) { return vmaddn(acc, a, b); }
 PS2_VU_INLINE v4u vmsubd(v4u acc, v4u a, v4u b) { return vmsubn(acc, a, b); }
 struct VuDaz {
     unsigned csr = 0;
+    void again() {}
 };
 PS2_VU_INLINE void vkick(unsigned, int unit, std::uint32_t address) { vu::kick(unit, address); }
 PS2_VU_INLINE void vkick_last(VuDaz &, int unit, std::uint32_t address) { vu::kick(unit, address); }

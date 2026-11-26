@@ -831,7 +831,10 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
             worth += loop ? kLoopRounds : 1;
         }
     }
-    const bool lazy = p.unit != 0 && worth >= kDazWorth;
+    // The fast vector unit (ps2::vu::fast_mode) runs its thread with the bits set, so a call writes no control register and every
+    // program of unit 1 gets the late clean-up. (Where the library is built without PS2_VU_FAST and without DAZ, the late forms are the
+    // eager ones, vu_ops.hpp: the choice never changes a result there.)
+    const bool lazy = p.unit != 0 && (worth >= kDazWorth || ps2::vu::fast_mode());
     bool any_arith = false;
     std::map<std::uint32_t, Effect> effect;
     std::map<std::uint32_t, Lanes> a_in, a_out, raw_live;
@@ -1182,9 +1185,25 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
     if (sticky_split)
         o += std::format("static __attribute__((noinline, cold)) void {0}_c(Vu0Regs &r, std::uint8_t *mem, {1}std::uint32_t &hop) {{ {0}_b<true>({2}); }}\n", name,
                          any_arith ? "VuDaz &daz, " : "", args);
+    // A hop to the program's own first pair goes round here, as `again:` does for the eager programs: the body is called again instead of
+    // the hop to the dispatcher (vu::entry() is where this run started, the address such a hop names). A body that gave the control bits back
+    // early (vkick_last: no arithmetic after it in this round) has them set again first (VuDaz::again).
+    static const bool no_loopback_lazy = std::getenv("PS2_VU_NO_LOOPBACK") != nullptr;
+    const bool loopback = !no_loopback_lazy && !dyn && delay.empty();
     const std::string pad = any_arith ? "        " : "    ";
     const std::string run = !sticky_split ? std::format("{}_b({});", name, args)
                                           : std::format("if ((r.status & 0xC0u) == 0xC0u) {0}_b<false>({1});\n{2}else {0}_c({1});", name, args, pad);
+    if (loopback) {
+        const std::string in = any_arith ? "            " : "        ";
+        const std::string round = sticky_split ? std::format("if ((r.status & 0xC0u) == 0xC0u) {0}_b<false>({1});\n{2}else {0}_c({1});", name, args, in)
+                                               : std::format("{}_b({});", name, args);
+        const std::string loop = std::format("for (;;) {{\n{0}{1}\n{0}if (hop != self) break;\n{0}hop = kNoHop;{2}\n{3}}}", in, round,
+                                             any_arith ? "\n" + in + "daz.again();" : "", any_arith ? "        " : "    ");
+        o += std::format("void {0}(Vu0Regs &r, std::uint8_t *mem) {{\n    std::uint32_t hop = kNoHop;\n    const std::uint32_t self = vu::entry();\n    {1}\n"
+                         "    if (hop != kNoHop) vu::interpret(1, hop);\n}}\n\n",
+                         name, any_arith ? std::format("{{\n        VuDaz daz;\n        {}\n    }}", loop) : loop);
+        return o;
+    }
     o += std::format("void {0}(Vu0Regs &r, std::uint8_t *mem) {{\n    std::uint32_t hop = kNoHop;\n    {1}\n    if (hop != kNoHop) vu::interpret(1, hop);\n}}\n\n", name,
                      !any_arith ? run : sticky_split ? std::format("{{\n        VuDaz daz;\n        {}\n    }}", run) : std::format("{{ VuDaz daz; {} }}", run));
     return o;
@@ -1196,12 +1215,14 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp). 16: VU1 programs keyed by program_key_moved, with the shift `sh` in them.
+// 21: a lazy program's hop to its own start goes round in its wrapper (as `again:` of the eager ones); with ps2::vu::fast_mode every
+//     unit-1 program is lazy.
 // 20: merge of upstream (EFU/WAITP stalls, Q read decided from the program's own pairs) with the Flipendo line below.
 // 19: the register file of a lazy program body is __restrict__ (the compiler keeps registers in machine registers across the stores to the
 //     data memory; the body hands over with vhop and returns, nothing else touches the registers meanwhile); 18: a jump to the program's
 //     own entry goes round inside the function (again:); 17: a kick goes out one pair late (vu::kick(1, 0xFFFF) after the pair that
 //     follows it). Upstream 17: a read of Q decided from the program's own pairs only (q_read_kind with the entry).
-const char *const kGeneratorVersion = "vurecomp 20";
+const char *const kGeneratorVersion = "vurecomp 21";
 
 // The key a program is built and found under, worked out from its code: VU0 keeps program_key (the address counts), VU1 has program_key_moved
 // (the same code at any address is one program). A recording of the old kind (VU1, its name holds a key that counted the address) is a

@@ -104,6 +104,8 @@ std::vector<std::string> compile_flags() {
     // PS2_VU_MCPU=<name> (e.g. cortex-a715): the processor the vector programs are scheduled for (only these libraries: a change of flags makes
     // every library of the cache again, and the translated game code is far dearer to make than these)
     if (const std::string cpu = ps2::os::env("PS2_VU_MCPU"); !cpu.empty()) flags.push_back("-mcpu=" + cpu);
+    // the fast clean-up (ps2/vu_ops.hpp, PS2_VU_FAST): part of the flags, so of the stamp, so exact and fast libraries never mix
+    if (vu::fast_mode()) flags.push_back("-DPS2_VU_FAST=1");
     return flags;
 }
 
