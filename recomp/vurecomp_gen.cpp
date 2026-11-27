@@ -1194,6 +1194,14 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
     }
     // Keep VI state in the register file for VU0 early-stop/budget exits.
     if (p.unit == 0) return o;
+    // The fast vector unit (M4a): DIV, SQRT and RSQRT of unit-1 programs with the processor's float divide (vu.hpp, fdiv). Unit 0 keeps
+    // the exact ones: its results reach the game's logic. PS2_VU_EXACT_DIV=1 at generation time keeps them exact here too.
+    static const bool exact_div = std::getenv("PS2_VU_EXACT_DIV") != nullptr;
+    if (ps2::vu::fast_mode() && !exact_div) {
+        replace_all(o, "vu::div(r, ", "vu::fdiv(r, ");
+        replace_all(o, "vu::sqrt(r, ", "vu::fsqrt(r, ");
+        replace_all(o, "vu::rsqrt(r, ", "vu::frsqrt(r, ");
+    }
     if (!lazy) {
         // the clean-up at once (see `worth` above): every operand and every result goes through the whole vfix
         for (const auto &[from, to] : std::initializer_list<std::pair<const char *, const char *>>{
@@ -1263,6 +1271,7 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp). 16: VU1 programs keyed by program_key_moved, with the shift `sh` in them.
+// 23: with ps2::vu::fast_mode, unit-1 DIV/SQRT/RSQRT use the float divide (vu::fdiv, M4a).
 // 22: unit-1 float registers and ACC are locals of the function (local_vf, M3a).
 // 21: a lazy program's hop to its own start goes round in its wrapper (as `again:` of the eager ones); with ps2::vu::fast_mode every
 //     unit-1 program is lazy.
@@ -1271,7 +1280,7 @@ namespace ps2::vurecomp {
 //     data memory; the body hands over with vhop and returns, nothing else touches the registers meanwhile); 18: a jump to the program's
 //     own entry goes round inside the function (again:); 17: a kick goes out one pair late (vu::kick(1, 0xFFFF) after the pair that
 //     follows it). Upstream 17: a read of Q decided from the program's own pairs only (q_read_kind with the entry).
-const char *const kGeneratorVersion = "vurecomp 22";
+const char *const kGeneratorVersion = "vurecomp 23";
 
 // The key a program is built and found under, worked out from its code: VU0 keeps program_key (the address counts), VU1 has program_key_moved
 // (the same code at any address is one program). A recording of the old kind (VU1, its name holds a key that counted the address) is a

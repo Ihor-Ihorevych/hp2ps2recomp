@@ -106,6 +106,8 @@ std::vector<std::string> compile_flags() {
     if (const std::string cpu = ps2::os::env("PS2_VU_MCPU"); !cpu.empty()) flags.push_back("-mcpu=" + cpu);
     // the fast clean-up (ps2/vu_ops.hpp, PS2_VU_FAST): part of the flags, so of the stamp, so exact and fast libraries never mix
     if (vu::fast_mode()) flags.push_back("-DPS2_VU_FAST=1");
+    // and without the clamp of every add, subtract and multiply result (vu_ops.hpp vclamp_result, M4b); PS2_VU_CLAMP=1 keeps it
+    if (vu::fast_mode() && ps2::os::env("PS2_VU_CLAMP") != "1") flags.push_back("-DPS2_VU_NOCLAMP=1");
     // nothing on the vector path throws: without this the VuDaz restorer of the lazy wrappers makes clean-up code that needs _Unwind_Resume,
     // which libps2main.so does not export on Android (the library made would not load and every program would run interpreted)
     flags.push_back("-fno-exceptions");

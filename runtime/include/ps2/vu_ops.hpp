@@ -1442,7 +1442,13 @@ PS2_VU_INLINE v4u vclamp(v4u x) {
 // bit set (tests/test_vu_cleanup.cpp). Never for a value loaded from a register or from memory: that may be a NaN, which MINPS
 // would turn into the positive limit whatever its sign.
 PS2_VU_INLINE v4u vclamp_result(v4f x) {
-#if defined(__aarch64__)
+#if PS2_VU_FTZ && defined(PS2_VU_NOCLAMP)
+    // The fast vector unit without the result clamp (M4b, vu_live.cpp passes PS2_VU_NOCLAMP unless PS2_VU_CLAMP=1): operands are still
+    // clamped where they come in (loads from memory and registers, vshadow; the quotient, vu::fdiv), so a sum or product of them is an
+    // infinity only when it overflows the float range, which a game's geometry and colours never reach. Two instructions fewer per add,
+    // subtract and multiply.
+    return (v4u)x;
+#elif defined(__aarch64__)
     // (FMIN and FMAX give a NaN for a NaN operand where MINPS gives the second one, but this value is never a NaN, as said above)
     return (v4u)vmaxq_f32(vminq_f32((float32x4_t)x, vreinterpretq_f32_u32(vdupq_n_u32(0x7F7FFFFFu))), vreinterpretq_f32_u32(vdupq_n_u32(0xFF7FFFFFu)));
 #else
@@ -1558,3 +1564,52 @@ PS2_VU_INLINE void vefu(unsigned, Vu0Regs &r, unsigned index, unsigned fs, unsig
 #endif
 
 }
+
+namespace ps2::vu {
+// (in this header, not vu.hpp: vu.hpp is part of the stamp of the translated game code, which these do not change)
+// The fast vector unit (PS2_VU_FAST, M4a; recomp/vurecomp_gen.cpp writes these for unit-1 programs only, whose results only make
+// pictures): DIV, SQRT and RSQRT with the processor's own float divide and square root instead of the console's bit-exact routes (an
+// integer divide of the mantissas, tens of cycles on a Cortex-A55). The last bit of a quotient may differ (round to nearest instead of
+// the console's cut). An operand with exponent 255 counts as the largest float, a denormal as a zero with its sign; a quotient that
+// overflows becomes the largest float with its sign (the console would give an exponent-255 number, which every later use treats
+// the same). Division by zero answers as the console does (sign | 0x7FFFFFFF, and the D/I status bit).
+inline std::uint32_t fast_operand(std::uint32_t x) {
+    const std::uint32_t e = x & 0x7F800000u;
+    if (e == 0x7F800000u) return (x & fp::kSign) | 0x7F7FFFFFu;
+    if (!e) return x & fp::kSign;
+    return x;
+}
+inline std::uint32_t fast_result(std::uint32_t q) {
+    const std::uint32_t e = q & 0x7F800000u;
+    if (e == 0x7F800000u) return (q & fp::kSign) | 0x7F7FFFFFu;
+    if (!e) return q & fp::kSign;
+    return q;
+}
+inline void fdiv(Vu0Regs &v, std::uint32_t s, std::uint32_t t) {
+    s = fast_operand(s);
+    t = fast_operand(t);
+    if (!(t & fp::kAbs)) [[unlikely]] {
+        v.q = ((s ^ t) & fp::kSign) | fp::kAbs;
+        v.status = (v.status & ~0x30u) | 0x20u;
+        return;
+    }
+    v.q = fast_result(std::bit_cast<std::uint32_t>(std::bit_cast<float>(s) / std::bit_cast<float>(t)));
+    v.status &= ~0x30u;
+}
+inline void fsqrt(Vu0Regs &v, std::uint32_t t) {
+    t = fast_operand(t) & fp::kAbs;
+    v.q = t ? fast_result(std::bit_cast<std::uint32_t>(__builtin_sqrtf(std::bit_cast<float>(t)))) : 0u;
+}
+inline void frsqrt(Vu0Regs &v, std::uint32_t s, std::uint32_t t) {
+    s = fast_operand(s);
+    t = fast_operand(t) & fp::kAbs;
+    if (!t) [[unlikely]] {
+        v.q = (s & fp::kSign) | fp::kAbs;
+        v.status = (v.status & ~0x30u) | 0x20u;
+        return;
+    }
+    v.q = fast_result(std::bit_cast<std::uint32_t>(std::bit_cast<float>(s) / __builtin_sqrtf(std::bit_cast<float>(t))));
+    v.status &= ~0x30u;
+}
+
+}  // namespace ps2::vu
