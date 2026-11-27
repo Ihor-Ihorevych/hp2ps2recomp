@@ -293,6 +293,7 @@ struct Vtx {
     u32 rgba;
     float s, t, q, fog;
     u32 di;
+    Vtx() {}  // not zeroed: g_verts grows by a whole run at once (prim_run) and every vertex is written right after
 };
 static_assert(sizeof(Vtx) == 36, "vertex layout");
 
@@ -2480,6 +2481,11 @@ std::vector<Corner> g_corners;
 std::vector<u32> g_corner_mark;  // == g_corner_pass: converted in this prim_run
 u32 g_corner_pass = 0;
 
+bool view4_pages_on() {  // shape()'s view4_pages (PS2_HWR_DIRECT_PAGES)
+    static const bool on = os::env("PS2_HWR_DIRECT_PAGES") != "0";
+    return on;
+}
+
 // ceil(d / 16) for a position in 1/16 pixels: the same as shape()'s std::ceil((float(x) - ofx) / 16.0f), which is exact in float (both
 // below 2^16), without the float rounding call (a library call on x86 without SSE4.1)
 inline int ceil16(int d) { return (d + 15) >> 4; }
@@ -2491,6 +2497,7 @@ inline int ceil16(int d) { return (d + 15) >> 4; }
 int prim_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u32 mip_top, const Vertex *v, int nverts, const u16 *idx, int prims, int per) {
     const u64 epoch = g_epoch;
     const bool sprite = per == 2;
+    const bool view4 = s.src.view == 4 && view4_pages_on();
     const u32 nv = sprite ? 6u : 3u;
     u64 attr = st.prim;
     if (!(st.prmodecont & 1u)) attr = (st.prim & 7u) | (st.prmode & ~7ull);
@@ -2550,6 +2557,16 @@ int prim_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u32 mi
             for (int j = 0; j < per; ++j) ci[j] = idx[per * k + j];
         } else {
             for (int j = 0; j < per; ++j) ci[j] = static_cast<u32>(per * k + j);
+        }
+        if (view4) {  // shape(): the texels must all lie in pages the source target holds, else this one is set up the old way there
+            Vertex tv[3];
+            for (int j = 0; j < per; ++j) tv[j] = v[ci[j]];
+            const Rect tr = read_rect(w, tv, per, 1 << (w[15] & 0xFFu), 1 << (w[15] >> 8));
+            bool inside = true;
+            for_pages(w[14], w[12], w[13], tr.x0, tr.y0, tr.x1, tr.y1, [&](u32 page) {
+                if (g_owner[page & (kPages - 1)] != s.src.target) inside = false;
+            });
+            if (!inside) break;
         }
         ++k;
         ++F.shapes;
@@ -2732,7 +2749,8 @@ void shapes(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seri
                 F.skipped += static_cast<u64>(rest);
                 return;
             }
-            bool fast = s.src.view != 4 && !(s.src.kind && s.src.target >= 0 && s.src.target == s.color) && s.kp2 == 0;
+            // view 4: only without mip levels (shape() looks at each level's pages then); prim_run checks each one's texel pages
+            bool fast = (s.src.view != 4 || !(mip_top && mip[0])) && !(s.src.kind && s.src.target >= 0 && s.src.target == s.color) && s.kp2 == 0;
             if (fast && per == 2) {
                 // sprites that could be part of a clear run or a cover run (shape(): clear_part, cover_part) go one by one
                 const Target &ct = *g_targets[static_cast<std::size_t>(s.color)];
@@ -2744,10 +2762,11 @@ void shapes(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seri
                 fast = !clear_part && !cover_part && !g_stream_order;
             }
             if (fast) {
-                if (idx) i += prim_run(s, st, w, mip, mip_top, v, nverts, idx + static_cast<std::size_t>(i) * static_cast<std::size_t>(per), rest, per);
-                else i += prim_run(s, st, w, mip, mip_top, v + static_cast<std::size_t>(i) * static_cast<std::size_t>(per), rest * per, nullptr, rest, per);
+                const int took = idx ? prim_run(s, st, w, mip, mip_top, v, nverts, idx + static_cast<std::size_t>(i) * static_cast<std::size_t>(per), rest, per)
+                                     : prim_run(s, st, w, mip, mip_top, v + static_cast<std::size_t>(i) * static_cast<std::size_t>(per), rest * per, nullptr, rest, per);
                 if (g_log) F.cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                continue;
+                i += took;
+                if (took) continue;  // none: a view-4 primitive whose texels leave its target, for shape()
             }
         }
         // a draw that reads its own target, reads through memory addresses (view 4), is drawn twice (alpha test) or may clear: shape() by shape
@@ -3780,7 +3799,7 @@ void submitted() {
 void frame_end() {
     if (!g_on) return;
     ++g_frames;
-#if defined(_WIN32)
+#if defined(PS2_DRAW_SAMPLER)
     if (g_frames == 100) {  // after the start (pipelines, translations)
         const std::string path = os::env("PS2_DRAW_SAMPLE");
         if (!path.empty()) drawtime::start_sampler(path.c_str());

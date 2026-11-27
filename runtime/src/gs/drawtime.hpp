@@ -76,7 +76,8 @@ struct Span {
 };
 
 
-#if defined(_WIN32)
+#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
+#define PS2_DRAW_SAMPLER 1
 // PS2_DRAW_SAMPLE=<file> (Windows, a measuring aid: Windows has no SIGPROF): a thread looks at the calling thread's instruction pointer
 // about once a millisecond and writes how often each address was seen to <file> every few thousand looks (address as linked, base
 // 0x140000000: map with llvm-nm). Started once, from the drawing thread.
@@ -95,7 +96,7 @@ inline void start_sampler(const char *path) {
             const bool ok = GetThreadContext(self, &ctx);
             ResumeThread(self);
             if (ok) ++seen[ctx.Rip];
-            if (n % 4000 == 0) {
+            if (n % 500 == 0) {
                 if (std::FILE *f = std::fopen(file.c_str(), "w")) {
                     for (const auto &[at, count] : seen) {
                         HMODULE m = nullptr;

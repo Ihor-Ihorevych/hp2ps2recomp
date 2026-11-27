@@ -791,7 +791,7 @@ struct Run {
     Vertex v[kRunVerts];
     std::uint16_t idx[3 * kRunPrims];
     int nv = 0, n = 0, per = 0;
-    std::uint16_t slot[3] = {0, 1, 2};
+    std::uint32_t slot[3] = {0, 1, 2};
     bool open = false;
 };
 Run g_run;
@@ -808,7 +808,7 @@ static void run_begin() {
     r.nv = s.count;
     for (int k = 0; k < s.count; ++k) {
         r.v[k] = s.queue[k];
-        r.slot[k] = static_cast<std::uint16_t>(k);
+        r.slot[k] = static_cast<std::uint32_t>(k);
     }
 }
 // what was gathered is drawn, and the queue is the GS's again
@@ -833,49 +833,11 @@ static void run_end() {
 }
 
 // Inlined into the PACKED run (write_packed_run): as a call of its own it cost the ship about 0.15 ms of the drawing thread a frame.
-// kRun: the primitive goes into the run (g_run) instead of to the renderer at once, and the queue is the run's corner numbers (hw mode
-// only; no CPU raster, no draw trace).
-template <bool kRun = false>
 [[gnu::always_inline]] static inline void kick(bool draw) {
     State &s = g_state;
     const std::uint32_t prim = static_cast<std::uint32_t>(s.prim) & 7u;
     const int needed = prim == 0 ? 1 : (prim == 1 || prim == 2 || prim == 6) ? 2 : prim == 7 ? 1 : 3;
     if (s.count < needed) return;
-#ifdef PS2_GPU
-    if constexpr (kRun) {
-        Run &r = g_run;
-        if (draw) {
-            if ((r.n && r.per != needed) || r.n == kRunPrims) {
-                run_end();
-                run_begin();
-            }
-            std::uint16_t *at = r.idx + static_cast<std::size_t>(r.n) * static_cast<std::size_t>(needed);
-            for (int k = 0; k < needed; ++k) at[k] = r.slot[k];
-            r.per = needed;
-            ++r.n;
-            ++g_primitives;
-        }
-        switch (prim) {
-        case 2:
-            r.slot[0] = r.slot[1];
-            s.count = 1;
-            break;
-        case 4:
-            r.slot[0] = r.slot[1];
-            r.slot[1] = r.slot[2];
-            s.count = 2;
-            break;
-        case 5:
-            r.slot[1] = r.slot[2];
-            s.count = 2;
-            break;
-        default:
-            s.count = 0;
-            break;
-        }
-        return;
-    }
-#endif
     if (draw) {
         if (!trace::g_any || trace::draw(s, needed)) {
             if (cpu_raster()) raster::draw(s, s.queue, needed);
@@ -905,24 +867,10 @@ template <bool kRun = false>
     }
 }
 
-template <bool kRun = false>
 [[gnu::always_inline]] static inline void vertex(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint8_t f, bool draw) {
     State &s = g_state;
     if (s.count >= 3) s.count = 2;
-    Vertex *vp;
-#ifdef PS2_GPU
-    if constexpr (kRun) {
-        Run &r = g_run;
-        if (r.nv == kRunVerts) {  // full: draw what was gathered, go on from the queue's corners
-            run_end();
-            run_begin();
-        }
-        r.slot[s.count++] = static_cast<std::uint16_t>(r.nv);
-        vp = &r.v[r.nv++];
-    } else
-#endif
-        vp = &s.queue[s.count++];
-    Vertex &v = *vp;
+    Vertex &v = s.queue[s.count++];
     v.x = x;
     v.y = y;
     v.z = z;
@@ -937,7 +885,7 @@ template <bool kRun = false>
     std::memcpy(&v.t, &tbits, 4);
     v.u = static_cast<std::uint32_t>(s.uv) & 0x3FFFu;
     v.v = static_cast<std::uint32_t>(s.uv >> 16) & 0x3FFFu;
-    kick<kRun>(draw);
+    kick(draw);
 }
 
 static const char *const g_gsseq = std::getenv("PS2_TRACE_GSSEQ");
@@ -1101,7 +1049,6 @@ static void write_packed_generic(std::uint32_t reg, const Reg128 &q);
 // stores them; write() would unpack the vertex words into one 64-bit value just for vertex() to take them apart again. It counts the register
 // in g_writes (statistics) and does not change g_setup_generation for these registers, as write() does. The rest, and everything while
 // PS2_TRACE_GSSEQ prints the writes, goes the old way.
-template <bool kRun = false>
 [[gnu::always_inline]] static inline void packed_one(std::uint32_t reg, const Reg128 &q) {
     State &s = g_state;
     switch (reg) {
@@ -1120,26 +1067,16 @@ template <bool kRun = false>
     case 0x4: {
         const bool adc = (q.d[1] >> 47) & 1u;
         ++g_writes[adc ? 0x0C : 0x04];
-        vertex<kRun>(q.w[0] & 0xFFFFu, q.w[1] & 0xFFFFu, (q.w[2] >> 4) & 0xFFFFFFu, static_cast<std::uint8_t>((q.w[3] >> 4) & 0xFFu), !adc);
+        vertex(q.w[0] & 0xFFFFu, q.w[1] & 0xFFFFu, (q.w[2] >> 4) & 0xFFFFFFu, static_cast<std::uint8_t>((q.w[3] >> 4) & 0xFFu), !adc);
         break;
     }
     case 0x5: {
         const bool adc = (q.d[1] >> 47) & 1u;
         ++g_writes[adc ? 0x0D : 0x05];
-        vertex<kRun>(q.w[0] & 0xFFFFu, q.w[1] & 0xFFFFu, q.w[2], static_cast<std::uint8_t>(s.fog >> 56), !adc);
+        vertex(q.w[0] & 0xFFFFu, q.w[1] & 0xFFFFu, q.w[2], static_cast<std::uint8_t>(s.fog >> 56), !adc);
         break;
     }
-    default:
-#ifdef PS2_GPU
-        if constexpr (kRun) {  // the state may change: what was gathered is drawn with the state it had
-            run_end();
-            write_packed_generic(reg, q);
-            run_begin();
-            break;
-        }
-#endif
-        write_packed_generic(reg, q);
-        break;
+    default: write_packed_generic(reg, q); break;
     }
 }
 
@@ -1152,6 +1089,130 @@ void write_packed(std::uint32_t reg, const Reg128 &q) {
     packed_one(reg, q);
 }
 
+#ifdef PS2_GPU
+// write_packed_run in hw mode: the same register writes as packed_one for each qword, but the vertices go into the open run (g_run) and
+// its primitives are corner numbers. The vertex registers (RGBAQ, ST, UV, Q) and the queue (its length and run corner numbers) live in
+// locals for the loop and are written back before anything else can see them (another register, a full run, the end): kept in memory
+// they cost store-forwarding stalls (a 16-byte read of RGBAQ and ST right after two 8-byte writes, the queue shifted as one wide word).
+static void gather_run(const std::uint8_t *data, std::uint32_t count, std::uint64_t regs, std::uint32_t nreg, std::uint32_t reg) {
+    State &s = g_state;
+    Run &r = g_run;
+    if (!r.open) run_begin();
+    std::uint32_t prim = 0;
+    int needed = 0;
+    std::uint64_t rgbaq = 0, st = 0, uv = 0;
+    std::uint32_t qbits = 0;
+    int cnt = 0, nv = 0, n = 0;
+    std::uint32_t sl0 = 0, sl1 = 0, sl2 = 0;
+    const auto load = [&] {
+        prim = static_cast<std::uint32_t>(s.prim) & 7u;
+        needed = prim == 0 ? 1 : (prim == 1 || prim == 2 || prim == 6) ? 2 : prim == 7 ? 1 : 3;
+        if (r.n && r.per != needed) {  // (cannot happen: the kind of primitive changes only with PRIM, which ends the run)
+            run_end();
+            run_begin();
+        }
+        rgbaq = s.rgbaq, st = s.st, uv = s.uv;
+        std::memcpy(&qbits, &s.q, 4);
+        cnt = s.count, nv = r.nv, n = r.n;
+        sl0 = r.slot[0], sl1 = r.slot[1], sl2 = r.slot[2];
+    };
+    const auto store = [&] {
+        s.rgbaq = rgbaq, s.st = st, s.uv = uv;
+        std::memcpy(&s.q, &qbits, 4);
+        s.count = cnt, r.nv = nv, r.n = n;
+        r.slot[0] = sl0, r.slot[1] = sl1, r.slot[2] = sl2;
+        if (n) r.per = needed;
+    };
+    load();
+    // the data was written by the vector-unit thread on another core: ask for its lines at once instead of one miss after another
+    for (std::uint32_t off = 0; off < count * 16u && off < 2048u; off += 64u) __builtin_prefetch(data + off);
+    for (std::uint32_t k = 0; k < count; ++k) {
+        Reg128 q;
+        std::memcpy(&q, data + static_cast<std::size_t>(k) * 16, 16);
+        const std::uint32_t d = static_cast<std::uint32_t>(regs >> (reg * 4)) & 0xFu;
+        if (++reg >= nreg) reg = 0;
+        std::uint32_t x, y, z;
+        std::uint8_t f;
+        bool draw;
+        switch (d) {
+        case 0x1:
+            rgbaq = (q.w[0] & 0xFFu) | ((q.w[1] & 0xFFu) << 8) | ((q.w[2] & 0xFFu) << 16) | ((q.w[3] & 0xFFu) << 24) | (static_cast<std::uint64_t>(qbits) << 32);
+            continue;
+        case 0x2:
+            st = q.d[0];
+            qbits = q.w[2];
+            continue;
+        case 0x3: uv = (q.w[0] & 0x3FFFu) | ((q.w[1] & 0x3FFFu) << 16); continue;
+        case 0x4: {
+            const bool adc = (q.d[1] >> 47) & 1u;
+            ++g_writes[adc ? 0x0C : 0x04];
+            x = q.w[0] & 0xFFFFu, y = q.w[1] & 0xFFFFu, z = (q.w[2] >> 4) & 0xFFFFFFu, f = static_cast<std::uint8_t>((q.w[3] >> 4) & 0xFFu), draw = !adc;
+            break;
+        }
+        case 0x5: {
+            const bool adc = (q.d[1] >> 47) & 1u;
+            ++g_writes[adc ? 0x0D : 0x05];
+            x = q.w[0] & 0xFFFFu, y = q.w[1] & 0xFFFFu, z = q.w[2], f = static_cast<std::uint8_t>(s.fog >> 56), draw = !adc;
+            break;
+        }
+        default:  // the state may change: what was gathered is drawn with the state it had
+            store();
+            run_end();
+            write_packed_generic(d, q);
+            run_begin();
+            load();
+            continue;
+        }
+        // vertex(): into the run
+        if (cnt >= 3) cnt = 2;
+        if (nv == kRunVerts) {  // full: draw what was gathered, go on from the queue's corners
+            store();
+            run_end();
+            run_begin();
+            load();
+        }
+        Vertex &v = r.v[nv];
+        v.x = x, v.y = y, v.z = z, v.f = f;
+        v.r = static_cast<std::uint8_t>(rgbaq), v.g = static_cast<std::uint8_t>(rgbaq >> 8), v.b = static_cast<std::uint8_t>(rgbaq >> 16), v.a = static_cast<std::uint8_t>(rgbaq >> 24);
+        const std::uint32_t vq = static_cast<std::uint32_t>(rgbaq >> 32), vs = static_cast<std::uint32_t>(st), vt = static_cast<std::uint32_t>(st >> 32);
+        std::memcpy(&v.q, &vq, 4);
+        std::memcpy(&v.s, &vs, 4);
+        std::memcpy(&v.t, &vt, 4);
+        v.u = static_cast<std::uint32_t>(uv) & 0x3FFFu;
+        v.v = static_cast<std::uint32_t>(uv >> 16) & 0x3FFFu;
+        const std::uint32_t at = static_cast<std::uint32_t>(nv++);
+        if (cnt == 0) sl0 = at;
+        else if (cnt == 1) sl1 = at;
+        else sl2 = at;
+        ++cnt;
+        // kick()
+        if (cnt < needed) continue;
+        if (draw) {
+            if (n == kRunPrims) {
+                store();
+                run_end();
+                run_begin();
+                load();
+            }
+            std::uint16_t *out = r.idx + static_cast<std::size_t>(n) * static_cast<std::size_t>(needed);
+            out[0] = static_cast<std::uint16_t>(sl0);
+            if (needed > 1) out[1] = static_cast<std::uint16_t>(sl1);
+            if (needed > 2) out[2] = static_cast<std::uint16_t>(sl2);
+            ++n;
+            ++g_primitives;
+        }
+        switch (prim) {
+        case 2: sl0 = sl1, cnt = 1; break;
+        case 4: sl0 = sl1, sl1 = sl2, cnt = 2; break;
+        case 5: sl1 = sl2, cnt = 2; break;
+        default: cnt = 0; break;
+        }
+    }
+    store();
+}
+#endif
+
+
 // `count` qwords of PACKED data in a row, the first for descriptor `reg` of `regs` (`nreg` of them): the same writes in the same order as
 // write_packed for each one, but one call for the run instead of one per qword. On the God of War ship (about 53,000 small triangles a
 // frame, nine qwords each) the calls, the trace check and the reloads around them took about 0.3 ms of the drawing thread a frame.
@@ -1160,15 +1221,7 @@ void write_packed_run(const std::uint8_t *data, std::uint32_t count, std::uint64
     // hw mode: the primitives of the run go to the renderer together (gpu::draw_run; PS2_HWR_BATCH=0 one by one as before)
     if (!g_gsseq && !trace::g_any && gpu_on() && !cpu_raster() && gpu::batch_wanted()) {
         const drawtime::Span packed_span(drawtime::kPacked);
-        if (!g_run.open) run_begin();
-        // the data was written by the vector-unit thread on another core: ask for its lines at once instead of one miss after another
-        for (std::uint32_t off = 0; off < count * 16u && off < 4096u; off += 64u) __builtin_prefetch(data + off);
-        for (std::uint32_t k = 0; k < count; ++k) {
-            Reg128 q;
-            std::memcpy(&q, data + static_cast<std::size_t>(k) * 16, 16);
-            packed_one<true>(static_cast<std::uint32_t>(regs >> (reg * 4)) & 0xFu, q);
-            if (++reg >= nreg) reg = 0;
-        }
+        gather_run(data, count, regs, nreg, reg);
         if (!g_run_keep) run_end();
         return;
     }
