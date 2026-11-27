@@ -92,6 +92,7 @@ else()
         runtime/src/dmac.cpp
         runtime/src/vif.cpp
         runtime/src/vu_micro.cpp
+        runtime/src/hp2_vu1.cpp
         runtime/src/vu_jit.cpp
         runtime/src/vu_jit_web.cpp
         runtime/src/live_build.cpp

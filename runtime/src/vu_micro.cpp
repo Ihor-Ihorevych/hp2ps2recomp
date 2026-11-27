@@ -29,6 +29,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+namespace ps2::hp2 {
+std::uint32_t stage_16d8(Vu0Regs &r, std::uint8_t *mem, bool guard);  // hp2_vu1.cpp: Harry Potter 2's native VU1 stages
+}
+
 namespace ps2::vu {
 
 std::uint32_t g_trace_vu1_pc = 0;  // entry of the vector program run last (shown by the GS draw trace)
@@ -1303,6 +1307,144 @@ void runaway_summary() {
                      static_cast<unsigned long long>(sorted[i].key), sorted[i].compiled ? "compiled" : "interpreted", sorted[i].address);
 }
 
+
+// Harry Potter 2's native VU1 stages (hp2_vu1.cpp): PS2_HP2_NATIVE unset/1 = on with the guard band, exact, check, 0 = off; fast vector
+// unit only (the stages do the fast mode's arithmetic)
+int hp2_native_mode() {
+    static const int mode = [] {
+        const std::string v = os::env("PS2_HP2_NATIVE");
+        if (v == "0" || !fast_mode()) return 0;
+        if (v == "exact") return 2;
+        if (v == "check") return 3;
+        return 1;
+    }();
+    return mode;
+}
+constexpr std::uint64_t kHp2Stage16D8 = 0xC4C61B5987BD7B14ull;
+std::uint64_t g_hp2_taken = 0, g_hp2_declined = 0;  // PS2_HP2_NATIVE_LOG=1: printed every 100 000 batches
+
+// PS2_HP2_NATIVE=check: the native stage on a copy, then the compiled program for real, and every register and byte compared
+extern std::int64_t g_chained;
+std::uint64_t time_stamp();
+bool g_hp2_quiet = false;  // the native stage's clipped pieces are not sent (a timing run on a copy)
+void hp2_check(ProgramFn compiled) {
+    static std::uint64_t runs = 0, compared = 0, declined = 0, clipped = 0, mismatches = 0;
+    static Vu0Regs regs;
+    static std::uint8_t mem[16384];
+    regs = g_vu1;
+    std::memcpy(mem, g_vu1_mem, sizeof mem);
+    // PS2_HP2_NATIVE_TIME=1 (with check): the native stage with the guard band and its clipping (on a second copy) and the compiled
+    // stage with its whole chain (clip handler, clipper) are timed on the same batch, totals printed with the counts
+    static const bool timed = std::getenv("PS2_HP2_NATIVE_TIME") != nullptr;
+    static std::uint64_t t_native = 0, t_compiled = 0;
+    if (timed) {
+        static Vu0Regs regs2;
+        static std::uint8_t mem2[16384];
+        regs2 = g_vu1;
+        std::memcpy(mem2, g_vu1_mem, sizeof mem2);
+        g_hp2_quiet = true;
+        const std::uint64_t t0 = time_stamp();
+        hp2::stage_16d8(regs2, mem2, true);
+        t_native += time_stamp() - t0;
+        g_hp2_quiet = false;
+    }
+    static std::uint64_t t_exact = 0, n_exact = 0;
+    const std::uint64_t e0 = timed ? time_stamp() : 0;
+    const std::uint32_t next = hp2::stage_16d8(regs, mem, false);
+    if (timed && next) t_exact += time_stamp() - e0, ++n_exact;
+    if (timed && runs % 20000 == 19999)
+        std::fprintf(stderr, "[hp2-time] native without the guard band, batches it takes: %.0f ticks a batch (%llu)\n",
+                     static_cast<double>(t_exact) / std::max<double>(1.0, static_cast<double>(n_exact)), static_cast<unsigned long long>(n_exact));
+    const std::uint64_t c0 = timed ? time_stamp() : 0;
+    compiled(g_vu1, g_vu1_mem);
+    ++runs;
+    // the compiled stage hops through its clip handler (0x1860, the clipper 0x0CB8, 0x1890 ...) before it reaches the kick: follow the
+    // chain here, program by program, until it does (the hops the chain loop would make)
+    bool through_clipper = false;
+    for (int steps = 0; g_chained >= 0 && g_chained != 0x140 && steps < 100000; ++steps) {
+        const std::uint32_t pc = static_cast<std::uint32_t>(g_chained) & 16383u;
+        if (pc == 0x0CB8u) through_clipper = true;
+        const EntryCache &c = g_entries[pc >> 3];
+        if (c.generation != g_generation[1] || !c.function) break;  // not compiled: left to the chain loop, not compared
+        g_chained = -1;
+        g_vu1_entry = pc;
+        c.function(g_vu1, g_vu1_mem);
+    }
+    if (timed) {
+        t_compiled += time_stamp() - c0;
+        if (runs % 20000 == 0)
+            std::fprintf(stderr, "[hp2-time] %llu batches of 16D8: native %.0f ticks a batch, compiled with its clipper %.0f (x%.2f)\n", static_cast<unsigned long long>(runs),
+                         static_cast<double>(t_native) / static_cast<double>(runs), static_cast<double>(t_compiled) / static_cast<double>(runs),
+                         static_cast<double>(t_compiled) / std::max(1.0, static_cast<double>(t_native)));
+    }
+    if (g_chained != 0x140 || through_clipper) {
+        ++clipped;
+        if (next && ++mismatches <= 20)
+            std::fprintf(stderr, "[hp2-check] native took a batch the compiled program clipped (%s)\n", through_clipper ? "through the clipper" : "chain left");
+    } else if (!next) {
+        ++declined;
+    } else {
+        ++compared;
+        std::string what;
+        char buf[160];
+        // vf11, vf12, vf15 and ACC end with values worked out from the corner after the batch's last (the loop transforms ahead), often an
+        // overflow there, where the compiled program's register copies and the native stage round an infinity differently; no program
+        // reads them before writing them (the kick at 0x0140, then the next batch's stages): their differences are counted, not shown
+        static std::uint64_t dead_diffs = 0;
+        bool dead = false;
+        for (int i : {11, 12, 15})
+            if (std::memcmp(&regs.vf[i], &g_vu1.vf[i], 16) != 0) dead = true, regs.vf[i] = g_vu1.vf[i];
+        if (std::memcmp(&regs.acc, &g_vu1.acc, 16) != 0) dead = true, regs.acc = g_vu1.acc;
+        if (dead && ++dead_diffs % 10000 == 1) std::fprintf(stderr, "[hp2-check] %llu runs with differences in vf11/vf12/vf15/ACC only (dead at the exit)\n", static_cast<unsigned long long>(dead_diffs));
+        for (int i = 0; i < 32; ++i)
+            if (std::memcmp(&regs.vf[i], &g_vu1.vf[i], 16) != 0) {
+                std::snprintf(buf, sizeof buf, " vf%d %08X %08X %08X %08X want %08X %08X %08X %08X;", i, regs.vf[i].w[0], regs.vf[i].w[1], regs.vf[i].w[2], regs.vf[i].w[3],
+                              g_vu1.vf[i].w[0], g_vu1.vf[i].w[1], g_vu1.vf[i].w[2], g_vu1.vf[i].w[3]);
+                what += buf;
+            }
+        if (std::memcmp(&regs.acc, &g_vu1.acc, 16) != 0) {
+            std::snprintf(buf, sizeof buf, " acc %08X %08X %08X %08X want %08X %08X %08X %08X;", regs.acc.w[0], regs.acc.w[1], regs.acc.w[2], regs.acc.w[3], g_vu1.acc.w[0],
+                          g_vu1.acc.w[1], g_vu1.acc.w[2], g_vu1.acc.w[3]);
+            what += buf;
+        }
+        for (int i = 0; i < 16; ++i)
+            if (regs.vi[i] != g_vu1.vi[i]) {
+                std::snprintf(buf, sizeof buf, " vi%d %04X want %04X;", i, regs.vi[i], g_vu1.vi[i]);
+                what += buf;
+            }
+        const std::pair<const char *, std::pair<std::uint32_t, std::uint32_t>> words[] = {
+            {"q", {regs.q, g_vu1.q}}, {"mac", {regs.mac, g_vu1.mac}}, {"status", {regs.status, g_vu1.status}}, {"clip", {regs.clip, g_vu1.clip}}};
+        for (const auto &[name, v] : words)
+            if (v.first != v.second) {
+                std::snprintf(buf, sizeof buf, " %s %08X want %08X;", name, v.first, v.second);
+                what += buf;
+            }
+        int bad_words = 0, first = -1;
+        for (int i = 0; i < 4096; ++i) {
+            std::uint32_t a, b;
+            std::memcpy(&a, mem + i * 4, 4);
+            std::memcpy(&b, g_vu1_mem + i * 4, 4);
+            if (a != b) {
+                if (first < 0) first = i;
+                ++bad_words;
+            }
+        }
+        if (bad_words) {
+            std::uint32_t a, b;
+            std::memcpy(&a, mem + first * 4, 4);
+            std::memcpy(&b, g_vu1_mem + first * 4, 4);
+            std::snprintf(buf, sizeof buf, " memory: %d words differ, first qword %d word %d: %08X want %08X;", bad_words, first / 4, first % 4, a, b);
+            what += buf;
+        }
+        if (!what.empty() && ++mismatches <= 20)
+            std::fprintf(stderr, "[hp2-check] stage 16D8, N %u, top %04X:%s\n", static_cast<unsigned>(g_vu1.vi[15]), 0u, what.c_str());
+    }
+    if (runs % 20000 == 0)
+        std::fprintf(stderr, "[hp2-check] %llu runs of 16D8: %llu compared (%llu with differences so far), %llu declined, %llu clipped by the program\n",
+                     static_cast<unsigned long long>(runs), static_cast<unsigned long long>(compared), static_cast<unsigned long long>(mismatches),
+                     static_cast<unsigned long long>(declined), static_cast<unsigned long long>(clipped));
+}
+
 std::uint32_t top() { return g_top; }
 std::uint32_t itop() { return g_itop; }
 std::uint32_t itop(int unit) { return unit == 0 ? vif::itop(0) : g_itop; }
@@ -1448,7 +1590,25 @@ void interpret_full(int unit, std::uint32_t pc) {
                 g_vu1_entry = pc & 16383u;
                 if (prov::g_on) prov::vu_run(pc & 16383u, e.key);
                 const prof::Scope prog_scope(prof::kVProg);
-                e.function(g_vu1, g_vu1_mem);
+                // Harry Potter 2's transform stage done natively (hp2_vu1.cpp); the compiled program when the stage declines the batch
+                const int hp2 = hp2_native_mode();
+                if (hp2 && (pc & 16383u) == 0x16D8u && e.key == kHp2Stage16D8) {
+                    if (hp2 == 3) {
+                        hp2_check(e.function);
+                    } else if (const std::uint32_t next = hp2::stage_16d8(g_vu1, g_vu1_mem, hp2 == 1)) {
+                        g_chained = next;
+                        ++g_hp2_taken;
+                    } else {
+                        e.function(g_vu1, g_vu1_mem);
+                        ++g_hp2_declined;
+                    }
+                    static const bool log = std::getenv("PS2_HP2_NATIVE_LOG") != nullptr;
+                    if (log && (g_hp2_taken + g_hp2_declined) % 100000 == 0)
+                        std::fprintf(stderr, "[hp2] stage 16D8: %llu batches native, %llu to the compiled program (a triangle the clipper has to cut)\n",
+                                     static_cast<unsigned long long>(g_hp2_taken), static_cast<unsigned long long>(g_hp2_declined));
+                } else {
+                    e.function(g_vu1, g_vu1_mem);
+                }
             } else {
                 run_entry(1, pc);
             }
@@ -2292,4 +2452,15 @@ void state(ps2::state::Stream &s) {
     }
 }
 
+}
+
+namespace ps2::vu {
+// Harry Potter 2's native stages (hp2_vu1.cpp): a GIF packet built outside the VU's data memory (the pieces of clipped triangles), sent as
+// an XGKICK sends one, after a kick still waiting for its pair (kick_flush), so the order of the packets stays the program's.
+extern bool g_hp2_quiet;
+void hp2_send_packet(const std::uint8_t *data, std::uint32_t qwords) {
+    if (g_hp2_quiet) return;
+    kick_flush();
+    gif::transfer(1, data, qwords);
+}
 }
