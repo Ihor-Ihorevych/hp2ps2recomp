@@ -1590,6 +1590,7 @@ std::vector<std::uint8_t> trip_fetch(const TripTicket &ticket) {
 
 bool trip_restore(const TripTicket &ticket, std::uint32_t qwc) {
 #ifdef PS2_GPU
+    run_close();  // image data in place of a GIF message's bytes: the open run of triangles is drawn first
     trip::Slot &s = trip::g_slots[ticket.slot % trip::kSlots];
     if (s.id != ticket.id || !s.saved || static_cast<std::size_t>(qwc) * 16 != s.bytes) return false;
     const std::uint64_t buf = g_state.bitbltbuf, pos = g_state.trxpos, reg = g_state.trxreg;
