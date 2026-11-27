@@ -31,6 +31,7 @@
 
 namespace ps2::hp2 {
 std::uint32_t stage_16d8(Vu0Regs &r, std::uint8_t *mem, bool guard);  // hp2_vu1.cpp: Harry Potter 2's native VU1 stages
+std::uint32_t stage_1c28(Vu0Regs &r, std::uint8_t *mem);              // hp2_vu1_skin.cpp: its skinning stage, fused
 }
 
 namespace ps2::vu {
@@ -1321,6 +1322,11 @@ int hp2_native_mode() {
     return mode;
 }
 constexpr std::uint64_t kHp2Stage16D8 = 0xC4C61B5987BD7B14ull;
+// the skinning stage: its entry and the four programs its vertex loop jumps to (keys of the code from each entry)
+constexpr std::uint32_t kHp2SkinAt[5] = {0x1C28u, 0x1D60u, 0x1E10u, 0x1E88u, 0x1EE0u};
+constexpr std::uint64_t kHp2Skin[5] = {0x42D6E9811029E540ull, 0xDBBD1B44AFD983D1ull, 0xA7B0B0B00784674Full, 0xECDBBCCBC548F551ull, 0xA04B3E566A765F4Dull};
+bool hp2_skin_known();  // below: the code at all five entries is the code the fused function was made from (keys known this code generation)
+void hp2_check_skin(ProgramFn compiled);
 std::uint64_t g_hp2_taken = 0, g_hp2_declined = 0;  // PS2_HP2_NATIVE_LOG=1: printed every 100 000 batches
 
 // PS2_HP2_NATIVE=check: the native stage on a copy, then the compiled program for real, and every register and byte compared
@@ -1443,6 +1449,90 @@ void hp2_check(ProgramFn compiled) {
         std::fprintf(stderr, "[hp2-check] %llu runs of 16D8: %llu compared (%llu with differences so far), %llu declined, %llu clipped by the program\n",
                      static_cast<unsigned long long>(runs), static_cast<unsigned long long>(compared), static_cast<unsigned long long>(mismatches),
                      static_cast<unsigned long long>(declined), static_cast<unsigned long long>(clipped));
+}
+
+// The skinning stage's five programs are all known with the keys the fused function was made from (an entry gets its key when the chain
+// loop first runs it in this code generation: until then the compiled programs run, and give them their keys)
+bool hp2_skin_known() {
+    for (int i = 1; i < 5; ++i) {
+        const EntryCache &c = g_entries[kHp2SkinAt[i] >> 3];
+        if (c.generation != g_generation[1] || c.key != kHp2Skin[i]) return false;
+    }
+    return true;
+}
+
+// PS2_HP2_NATIVE=check for the skinning stage: the fused function on a copy; the compiled programs for real, followed through the hops
+// among the five until the chain leaves them; then every register and byte compared
+void hp2_check_skin(ProgramFn compiled) {
+    static std::uint64_t runs = 0, compared = 0, declined = 0, mismatches = 0, left = 0;
+    static Vu0Regs regs;
+    static std::uint8_t mem[16384];
+    regs = g_vu1;
+    std::memcpy(mem, g_vu1_mem, sizeof mem);
+    static const bool timed = std::getenv("PS2_HP2_NATIVE_TIME") != nullptr;
+    static std::uint64_t t_native = 0, t_compiled = 0;
+    const std::uint64_t n0 = timed ? time_stamp() : 0;
+    const std::uint32_t next = hp2::stage_1c28(regs, mem);
+    if (timed) t_native += time_stamp() - n0;
+    const std::uint64_t c0 = timed ? time_stamp() : 0;
+    compiled(g_vu1, g_vu1_mem);
+    ++runs;
+    const auto inside = [](std::int64_t pc) {
+        for (std::uint32_t a : kHp2SkinAt)
+            if (pc == static_cast<std::int64_t>(a)) return true;
+        return false;
+    };
+    for (int steps = 0; g_chained >= 0 && inside(g_chained) && steps < 100000; ++steps) {
+        const std::uint32_t pc = static_cast<std::uint32_t>(g_chained) & 16383u;
+        const EntryCache &c = g_entries[pc >> 3];
+        if (c.generation != g_generation[1] || !c.function) break;
+        g_chained = -1;
+        g_vu1_entry = pc;
+        c.function(g_vu1, g_vu1_mem);
+    }
+    if (timed) {
+        t_compiled += time_stamp() - c0;
+        if (runs % 5000 == 0)
+            std::fprintf(stderr, "[hp2-time] %llu skinning runs: fused %.0f ticks a run, compiled chain %.0f (x%.2f)\n", static_cast<unsigned long long>(runs),
+                         static_cast<double>(t_native) / static_cast<double>(runs), static_cast<double>(t_compiled) / static_cast<double>(runs),
+                         static_cast<double>(t_compiled) / std::max(1.0, static_cast<double>(t_native)));
+    }
+    if (!next) {
+        ++declined;
+    } else if (inside(g_chained)) {
+        ++left;  // a program of the stage was not compiled: not compared
+    } else {
+        ++compared;
+        std::string what;
+        char buf[200];
+        if (static_cast<std::int64_t>(next) != g_chained) {
+            std::snprintf(buf, sizeof buf, " next %04X want %04X;", next, static_cast<unsigned>(g_chained));
+            what += buf;
+        }
+        for (int i = 0; i < 32; ++i)
+            if (std::memcmp(&regs.vf[i], &g_vu1.vf[i], 16) != 0) {
+                std::snprintf(buf, sizeof buf, " vf%d %08X %08X %08X %08X want %08X %08X %08X %08X;", i, regs.vf[i].w[0], regs.vf[i].w[1], regs.vf[i].w[2], regs.vf[i].w[3],
+                              g_vu1.vf[i].w[0], g_vu1.vf[i].w[1], g_vu1.vf[i].w[2], g_vu1.vf[i].w[3]);
+                what += buf;
+            }
+        if (std::memcmp(&regs.acc, &g_vu1.acc, 16) != 0) what += " acc;";
+        for (int i = 0; i < 16; ++i)
+            if (regs.vi[i] != g_vu1.vi[i]) {
+                std::snprintf(buf, sizeof buf, " vi%d %04X want %04X;", i, regs.vi[i], g_vu1.vi[i]);
+                what += buf;
+            }
+        if (regs.q != g_vu1.q || regs.i != g_vu1.i || regs.mac != g_vu1.mac || regs.status != g_vu1.status || regs.clip != g_vu1.clip) {
+            std::snprintf(buf, sizeof buf, " q/i/mac/status/clip %08X %08X %08X %08X %08X want %08X %08X %08X %08X %08X;", regs.q, regs.i, regs.mac, regs.status, regs.clip, g_vu1.q,
+                          g_vu1.i, g_vu1.mac, g_vu1.status, g_vu1.clip);
+            what += buf;
+        }
+        if (std::memcmp(mem, g_vu1_mem, sizeof mem) != 0) what += " memory;";
+        if (!what.empty() && ++mismatches <= 20) std::fprintf(stderr, "[hp2-check] skin 1C28:%s\n", what.c_str());
+    }
+    if (runs % 5000 == 0)
+        std::fprintf(stderr, "[hp2-check] %llu runs of the skinning stage: %llu compared (%llu with differences so far), %llu declined, %llu not compiled through\n",
+                     static_cast<unsigned long long>(runs), static_cast<unsigned long long>(compared), static_cast<unsigned long long>(mismatches),
+                     static_cast<unsigned long long>(declined), static_cast<unsigned long long>(left));
 }
 
 std::uint32_t top() { return g_top; }
@@ -1606,6 +1696,15 @@ void interpret_full(int unit, std::uint32_t pc) {
                     if (log && (g_hp2_taken + g_hp2_declined) % 100000 == 0)
                         std::fprintf(stderr, "[hp2] stage 16D8: %llu batches native, %llu to the compiled program (a triangle the clipper has to cut)\n",
                                      static_cast<unsigned long long>(g_hp2_taken), static_cast<unsigned long long>(g_hp2_declined));
+                } else if (hp2 && (pc & 16383u) == 0x1C28u && e.key == kHp2Skin[0] && hp2_skin_known()) {
+                    // the skinning stage's five programs as one function (hp2_vu1_skin.cpp)
+                    if (hp2 == 3) {
+                        hp2_check_skin(e.function);
+                    } else if (const std::uint32_t next = hp2::stage_1c28(g_vu1, g_vu1_mem)) {
+                        g_chained = next;
+                    } else {
+                        e.function(g_vu1, g_vu1_mem);
+                    }
                 } else {
                     e.function(g_vu1, g_vu1_mem);
                 }
