@@ -27,6 +27,8 @@ enum Part { kGif, kShape, kBuild, kParts };
 inline bool g_on = false;
 inline std::uint64_t g_sum[kParts] = {};
 inline std::uint64_t g_count[kParts] = {};
+// why gs.cpp closed an open run of triangles: a register write, a PACKED write outside a run, image data, another message (debug counts)
+inline std::uint64_t g_close[5] = {};
 
 inline std::uint64_t now() {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)

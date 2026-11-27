@@ -48,6 +48,7 @@ bool requested() {
 namespace {
 
 using u8 = std::uint8_t;
+using u16 = std::uint16_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 
@@ -200,6 +201,7 @@ struct Counters {
     u64 lookups = 0, hits = 0, misses = 0, decoded_texels = 0, target_reads = 0, self_copies = 0, loads = 0, stores = 0, targets_made = 0;
     u64 builds_epoch = 0; // of them only because the epoch moved on (same setup)
     u64 builds = 0;       // shape states worked out (build_state: a new setup, or the epoch or submit moved on)
+    u64 memo_hits = 0;    // of them taken from the memo of recent states (memo_find)
     u64 view4_out = 0;    // view-4 shapes whose texels left the source target's pages (set up the old way)
     u64 mipneed[8] = {};  // PS2_HWR_LOG=1: mipmapped draws by the number of levels (1..7) their corners can sample at most (a conservative bound)
     u64 mipdraws = 0;     // mipmapped draws counted
@@ -211,6 +213,9 @@ struct Counters {
 Counters F, T;  // this frame, the whole run
 u64 g_frames = 0;
 bool g_stream_order = false;  // PS2_HWR_ORDER=stream: no renaming, no reordering (M1's order; for comparing)
+// PS2_DRAW_TIME=ab / ab-memo: a measuring aid, the drawing thread's shortcuts (runs and state memo / only the memo) are switched off for
+// every other 100 pictures (frame_end), so both are timed in one run under the same load
+bool g_ab_off = false, g_ab_memo_only = false, g_ab_on = false;
 bool g_no_view4 = false;      // set while a shape whose texels leave its view-4 source target is set up again the old way (shape())
 bool g_dump_now = false;     // PS2_HWR_DUMP=<frame>: this frame's shapes and schedule are printed
 
@@ -976,6 +981,7 @@ struct DrawState {
     bool needs_depth = false, zwrite_any = false, cwrite_any = false, awrite_any = false, color_full = false;
     bool self_read = false;
     bool zread = false;
+    bool no_memo = false;  // read a target's picture through a write-back to memory: later writes to it are not seen in the epoch (memo_find)
 };
 DrawState g_ds;
 
@@ -1234,6 +1240,7 @@ void resolve_texture(DrawState &s, const u32 *w, const u32 *mip, u32 mip_top) {
             static const bool stale_self = os::env("PS2_HWR_STALE_SELF") != "0";
             store_for_memory(owner, tbp, tbw, tpsm, w[15] & 0xFFu, w[15] >> 8, stale_self && owner == s.color);
             from_stored = true;
+            s.no_memo = true;
             goto from_memory;
         }
         ++F.target_reads;
@@ -1290,6 +1297,7 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
     s.skip = 0;
     s.src = Source{};
     s.self_read = false;
+    s.no_memo = false;
     s.color = s.depth = -1;
     const u32 flags = w[0], fbp = w[1], fbw = w[2], fpsm = w[3], fbmsk = w[4], zbp = w[5], zpsm = w[6], modes = w[7];
     if (prim < 3) return fail(s, kPrimKind);
@@ -2003,7 +2011,13 @@ bool init(const Context &ctx) {
         std::fprintf(stderr, "[hwr] %zu pipelines made at the start (%zu keys, list %s) in %.1f ms\n", g_pipes.size(), keys.size(), path.empty() ? "-" : path.c_str(),
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
-    drawtime::g_on = os::env("PS2_DRAW_TIME") == "1";
+    {
+        const std::string dt = os::env("PS2_DRAW_TIME");
+        drawtime::g_on = dt == "1" || dt == "ab" || dt == "ab-memo";
+        g_ab_memo_only = dt == "ab-memo";
+        static const bool ab = dt == "ab" || dt == "ab-memo";
+        g_ab_on = ab;
+    }
     g_on = true;
     std::fprintf(stderr, "[hwr] hardware renderer on (PS2_RENDERER=hw): dual-source blending %s, texture cache %llu MB\n", C.dual ? "yes" : "no",
                  static_cast<unsigned long long>(g_cache_budget >> 20));
@@ -2017,10 +2031,45 @@ long skip_tbp_value() {
 }
 
 // the draw state of the shapes that follow, worked out again when the setup, the epoch (uploads, palette loads, page owners) or the submit changed
+// The states worked out last, by their setup words (a game sends the same registers again for each object: a new setup serial, the same
+// state). An entry is good while nothing it depends on changed: the same epoch (uploads, palette loads, page owners, targets made, grown or
+// renamed) and submit, and it did not read a target through a write-back to memory (no_memo: draws into that target do not move the epoch).
+// build_state does not read the GS state beyond the setup words, the mip words and the kind of primitive. PS2_HWR_STATE_MEMO=0: off.
+constexpr int kMemo = 8;
+struct Memo {
+    u64 epoch = 0, submit = ~0ull;
+    u32 words[40 + 8 + 2];
+    DrawState s;
+};
+Memo g_memo[kMemo];
+int g_memo_next = 0;
+bool memo_on() {
+    static const bool on = os::env("PS2_HWR_STATE_MEMO") != "0";
+    return on && !g_ab_off;
+}
+inline void memo_key(u32 *k, const u32 *w, const u32 *mip, u32 mip_top, u32 prim) {
+    std::memcpy(k, w, 40 * sizeof(u32));
+    std::memcpy(k + 40, mip, 8 * sizeof(u32));
+    k[48] = mip_top;
+    k[49] = prim < 3 ? 1u : 0u;
+}
+
 inline void prepare_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 serial, u32 prim) {
     if (s.serial != serial || s.epoch != g_epoch || s.submit != g_submit) {
         ++F.builds;
         if (s.serial == serial && s.submit == g_submit) ++F.builds_epoch;
+        u32 key[50];
+        const bool memo = memo_on() && !g_no_view4;
+        if (memo) {
+            memo_key(key, w, mip, mip_top, prim);
+            for (Memo &m : g_memo)
+                if (m.epoch == g_epoch && m.submit == g_submit && std::memcmp(m.words, key, sizeof key) == 0) {
+                    s = m.s;
+                    s.serial = serial;
+                    ++F.memo_hits;
+                    return;
+                }
+        }
         const auto b0 = g_log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const prof::Scope build_scope(prof::kRBuild);
         const drawtime::Span build_span(drawtime::kBuild);
@@ -2032,6 +2081,13 @@ inline void prepare_state(DrawState &s, const State &st, const u32 *w, const u32
         s.param = shape_params(s, mip, mip_top);
         s.sc[0] = static_cast<int>(w[10] & 0xFFFFu), s.sc[2] = static_cast<int>(w[10] >> 16);
         s.sc[1] = static_cast<int>(w[11] & 0xFFFFu), s.sc[3] = static_cast<int>(w[11] >> 16);
+        if (memo && !s.no_memo) {
+            Memo &m = g_memo[g_memo_next];
+            g_memo_next = (g_memo_next + 1) % kMemo;
+            m.epoch = s.epoch, m.submit = s.submit;
+            std::memcpy(m.words, key, sizeof key);
+            m.s = s;
+        }
     }
 }
 
@@ -2408,15 +2464,25 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
 
 bool batch_on() {
     static const bool on = os::env("PS2_HWR_BATCH") != "0";
-    return on;
+    return on && !(g_ab_off && !g_ab_memo_only);
 }
 
 namespace {
+// A corner of a run converted once (a strip's corner belongs to up to three triangles): its position in GS pixels and its card vertex with
+// its own colour (a flat-shaded triangle takes the colour of its last corner: shape()'s `iip ? v[i] : v[2]`).
+struct Corner {
+    float x, y;
+    Vtx o;
+};
+std::vector<Corner> g_corners;
+std::vector<u32> g_corner_mark;  // == g_corner_pass: converted in this triangle_run
+u32 g_corner_pass = 0;
+
 // Triangles of one run (shapes()) while the draw state stays what it is: what shape() does for each, in the same order and with the same
 // results, without what cannot change between them. Ends after the triangle that changed the epoch (a page taken from another owner, a
-// target grown): the next one's state is worked out again, as shape() would. Returns how many triangles it took.
-int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u32 mip_top, const Vertex *v, int prims, u32 prim) {
-    (void)prim;
+// target grown): the next one's state is worked out again, as shape() would. Triangle k has the corners v[idx[3k..3k+2]] (idx null: v[3k..]).
+// Returns how many triangles it took.
+int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u32 mip_top, const Vertex *v, int nverts, const u16 *idx, int prims) {
     const u64 epoch = g_epoch;
     u64 attr = st.prim;
     if (!(st.prmodecont & 1u)) attr = (st.prim & 7u) | (st.prmode & ~7ull);
@@ -2434,28 +2500,46 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
     const u32 zmax = s.zmax, param = s.param;
     const double zscale = s.zscale;
     // the pages already taken in this run (page columns and rows, inclusive): a triangle inside them changes no owner (and counts as a write
-    // to them already: g_page_write is only compared with what the last write-back saw)
+    // to them already: g_page_write is only compared with what the last write-back saw). Page sizes are powers of two.
     u32 cpw, cph, dpw = 1, dph = 1;
     page_dims(ct.psm, cpw, cph);
     if (dt) page_dims(dt->psm, dpw, dph);
+    const int csx = __builtin_ctz(cpw), csy = __builtin_ctz(cph), dsx = __builtin_ctz(dpw), dsy = __builtin_ctz(dph);
     int cpr[4] = {1, 1, 0, 0}, dpr[4] = {1, 1, 0, 0};  // empty
     DrawRec *cur = nullptr;  // the draw this run's triangles go into, once known
+    // corners converted on first use; the conversion depends on the state (scale, depth range, record), so once per call
+    if (g_corners.size() < static_cast<std::size_t>(nverts)) g_corners.resize(static_cast<std::size_t>(nverts)), g_corner_mark.resize(static_cast<std::size_t>(nverts), 0u);
+    if (++g_corner_pass == 0) {
+        std::fill(g_corner_mark.begin(), g_corner_mark.end(), 0u);
+        g_corner_pass = 1;
+    }
+    u32 pass_id = g_corner_pass;
+    Corner *corners = g_corners.data();
+    u32 *mark = g_corner_mark.data();
+    const auto corner = [&](u32 i) -> const Corner & {
+        Corner &c = corners[i];
+        if (mark[i] != pass_id) {
+            mark[i] = pass_id;
+            const Vertex &p = v[i];
+            c.x = (static_cast<float>(p.x) - ofx) / 16.0f;
+            c.y = (static_cast<float>(p.y) - ofy) / 16.0f;
+            put_vtx(c.o, c.x, c.y, p, p, p.z, p.f, p.q, sxs, sys, zmax, zscale, fst, param);
+        }
+        return c;
+    };
     const u32 first_all = static_cast<u32>(g_verts.size());
     g_verts.resize(first_all + static_cast<std::size_t>(prims) * 3u);  // written in place; cut to what was drawn at the end
     u32 used = first_all;
     int k = 0;
     while (k < prims) {
-        const Vertex *t = v + static_cast<std::size_t>(k) * 3u;
+        u32 ci[3];
+        if (idx) ci[0] = idx[3 * k], ci[1] = idx[3 * k + 1], ci[2] = idx[3 * k + 2];
+        else ci[0] = static_cast<u32>(3 * k), ci[1] = ci[0] + 1, ci[2] = ci[0] + 2;
         ++k;
         ++F.shapes;
-        float px[3], py[3];
-        float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f;
-        for (int i = 0; i < 3; ++i) {
-            px[i] = (static_cast<float>(t[i].x) - ofx) / 16.0f;
-            py[i] = (static_cast<float>(t[i].y) - ofy) / 16.0f;
-            minx = std::min(minx, px[i]), maxx = std::max(maxx, px[i]);
-            miny = std::min(miny, py[i]), maxy = std::max(maxy, py[i]);
-        }
+        const Corner *c[3] = {&corner(ci[0]), &corner(ci[1]), &corner(ci[2])};
+        const float minx = std::min({c[0]->x, c[1]->x, c[2]->x}), maxx = std::max({c[0]->x, c[1]->x, c[2]->x});
+        const float miny = std::min({c[0]->y, c[1]->y, c[2]->y}), maxy = std::max({c[0]->y, c[1]->y, c[2]->y});
         int x0 = std::max(s.sc[0], static_cast<int>(std::ceil(minx))), x1 = std::min(s.sc[2], static_cast<int>(std::ceil(maxx)));
         int y0 = std::max(s.sc[1], static_cast<int>(std::ceil(miny))), y1 = std::min(s.sc[3], static_cast<int>(std::ceil(maxy)));
         x0 = std::max(x0, 0), y0 = std::max(y0, 0);
@@ -2468,8 +2552,17 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
             grow(s.color, rows);
             if (s.needs_depth) grow(s.depth, rows);
             H = static_cast<int>(ct.h);
-            sys = 2.0f / static_cast<float>(H);
             cur = nullptr;  // another surface: the pass and the scissor are found again
+            // the card's y of every corner depends on the height: convert again (from this triangle on, as shape() would)
+            if (2.0f / static_cast<float>(H) != sys) {
+                sys = 2.0f / static_cast<float>(H);
+                if (++g_corner_pass == 0) {
+                    std::fill(g_corner_mark.begin(), g_corner_mark.end(), 0u);
+                    g_corner_pass = 1;
+                }
+                pass_id = g_corner_pass;
+                for (int i = 0; i < 3; ++i) c[i] = &corner(ci[i]);
+            }
         }
         if (x1 >= W || y1 >= H) {
             ++F.approx[kOutside];
@@ -2486,7 +2579,7 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
             float lod_max = kk;
             if (!(m & 1u) && !(w[0] & 16u)) {
                 float qmin = 1e30f;
-                for (int i = 0; i < 3; ++i) qmin = std::min(qmin, std::fabs(t[i].q));
+                for (int i = 0; i < 3; ++i) qmin = std::min(qmin, std::fabs(v[ci[i]].q));
                 lod_max = qmin > 0.0f ? std::log2(1.0f / qmin) * static_cast<float>(1u << ((m >> 8) & 3u)) + kk : 1e9f;
             }
             const u32 need = lod_max <= -0.01f ? 1u : std::min<u32>(mip_top + 1u, static_cast<u32>(std::floor(lod_max)) + 2u);
@@ -2495,7 +2588,8 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
         }
         const u32 first = used;
         Vtx *out = g_verts.data() + first;
-        for (int i = 0; i < 3; ++i) put_vtx(out[i], px[i], py[i], iip ? t[i] : t[2], t[i], t[i].z, t[i].f, t[i].q, sxs, sys, zmax, zscale, fst, param);
+        out[0] = c[0]->o, out[1] = c[1]->o, out[2] = c[2]->o;
+        if (!iip) out[0].rgba = out[1].rgba = out[2].rgba;
         used += 3;
         if (cur) {
             cur->count += 3;
@@ -2531,25 +2625,25 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
         }
         if (s.cwrite_any) {
             ct.valid_w = std::max(ct.valid_w, x1 + 1), ct.valid_h = std::max(ct.valid_h, y1 + 1);
-            const int a = x0 / static_cast<int>(cpw), b = y0 / static_cast<int>(cph), c = x1 / static_cast<int>(cpw), d = y1 / static_cast<int>(cph);
-            if (a < cpr[0] || b < cpr[1] || c > cpr[2] || d > cpr[3]) {
+            const int a = x0 >> csx, b = y0 >> csy, cc = x1 >> csx, d = y1 >> csy;
+            if (a < cpr[0] || b < cpr[1] || cc > cpr[2] || d > cpr[3]) {
                 for_pages(ct.psm, ct.bp, ct.bw, x0, y0, x1, y1, [&](u32 page) {
                     take_page(s.color, page);
                     ++g_page_write[page & (kPages - 1)];
                 });
-                cpr[0] = a, cpr[1] = b, cpr[2] = c, cpr[3] = d;
+                cpr[0] = a, cpr[1] = b, cpr[2] = cc, cpr[3] = d;
             }
             note_write(ct, x0, y0, x1, y1, s.awrite_any);
         }
         if (s.zwrite_any && dt) {
             dt->valid_w = std::max(dt->valid_w, x1 + 1), dt->valid_h = std::max(dt->valid_h, y1 + 1);
-            const int a = x0 / static_cast<int>(dpw), b = y0 / static_cast<int>(dph), c = x1 / static_cast<int>(dpw), d = y1 / static_cast<int>(dph);
-            if (a < dpr[0] || b < dpr[1] || c > dpr[2] || d > dpr[3]) {
+            const int a = x0 >> dsx, b = y0 >> dsy, cc = x1 >> dsx, d = y1 >> dsy;
+            if (a < dpr[0] || b < dpr[1] || cc > dpr[2] || d > dpr[3]) {
                 for_pages(dt->psm, dt->bp, dt->bw, x0, y0, x1, y1, [&](u32 page) {
                     take_page(s.depth, page);
                     ++g_page_write[page & (kPages - 1)];
                 });
-                dpr[0] = a, dpr[1] = b, dpr[2] = c, dpr[3] = d;
+                dpr[0] = a, dpr[1] = b, dpr[2] = cc, dpr[3] = d;
             }
         }
         ++F.drawn;
@@ -2561,10 +2655,19 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
 }
 }  // namespace
 
-void shapes(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 serial, const Vertex *v, int prims, int per) {
+void shapes(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 serial, const Vertex *v, int nverts, const u16 *idx, int prims, int per) {
     const u32 prim = static_cast<u32>(st.prim) & 7u;
+    const auto one = [&](int i) {  // primitive i through shape()
+        if (!idx) {
+            shape(st, w, mip, mip_top, serial, v + static_cast<std::size_t>(i) * static_cast<std::size_t>(per), per);
+            return;
+        }
+        Vertex c[3];
+        for (int j = 0; j < per; ++j) c[j] = v[idx[i * per + j]];
+        shape(st, w, mip, mip_top, serial, c, per);
+    };
     if (!batch_on() || per != 3 || prim < 3 || prim > 5 || g_dump_now || prov::g_on || page_log() >= 0 || skip_tbp_value() >= 0) {
-        for (int i = 0; i < prims; ++i) shape(st, w, mip, mip_top, serial, v + static_cast<std::size_t>(i) * static_cast<std::size_t>(per), per);
+        for (int i = 0; i < prims; ++i) one(i);
         return;
     }
     DrawState &s = g_ds;
@@ -2588,13 +2691,14 @@ void shapes(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seri
             }
             const bool fast = s.src.view != 4 && !(s.src.kind && s.src.target >= 0 && s.src.target == s.color) && s.kp2 == 0;
             if (fast) {
-                i += triangle_run(s, st, w, mip, mip_top, v + static_cast<std::size_t>(i) * 3u, rest, prim);
+                if (idx) i += triangle_run(s, st, w, mip, mip_top, v, nverts, idx + static_cast<std::size_t>(i) * 3u, rest);
+                else i += triangle_run(s, st, w, mip, mip_top, v + static_cast<std::size_t>(i) * 3u, rest * 3, nullptr, rest);
                 if (g_log) F.cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 continue;
             }
         }
         // a draw that reads its own target, reads through memory addresses (view 4) or is drawn twice (alpha test): shape() by shape
-        shape(st, w, mip, mip_top, serial, v + static_cast<std::size_t>(i) * 3u, 3);
+        one(i);
         ++i;
     }
 }
@@ -3639,6 +3743,13 @@ void frame_end() {
                          static_cast<unsigned long long>(drawtime::g_count[drawtime::kGif] / 100), ms(drawtime::kShape),
                          static_cast<unsigned long long>(drawtime::g_count[drawtime::kShape] / 100), ms(drawtime::kBuild),
                          static_cast<unsigned long long>(drawtime::g_count[drawtime::kBuild] / 100));
+            std::fprintf(stderr, "[draw-time] runs closed per picture by: register writes %.0f, single PACKED writes %.0f, image data %.0f, other messages %.0f, other PACKED tags %.0f\n",
+                         drawtime::g_close[0] / 100.0, drawtime::g_close[1] / 100.0, drawtime::g_close[2] / 100.0, drawtime::g_close[3] / 100.0, drawtime::g_close[4] / 100.0);
+            for (auto &c : drawtime::g_close) c = 0;
+            if (g_ab_on) {
+                std::fprintf(stderr, "[draw-time] (the 100 pictures above: %s)\n", g_ab_off ? (g_ab_memo_only ? "memo OFF" : "shortcuts OFF") : "shortcuts on");
+                g_ab_off = !g_ab_off;
+            }
             for (int k = 0; k < drawtime::kParts; ++k) drawtime::g_sum[k] = drawtime::g_count[k] = 0;
             tsc0 = tsc1, clock0 = clock1;
         }
@@ -3671,8 +3782,8 @@ void frame_end() {
         if (g_mem_read_hits) std::fprintf(stderr, " | uploads into pages a draw reads from memory %llu", static_cast<unsigned long long>(g_mem_read_hits));
         if (g_mem_read_changes) std::fprintf(stderr, " | of them with other content %llu", static_cast<unsigned long long>(g_mem_read_changes));
         g_mem_read_hits = g_mem_read_changes = 0;
-        std::fprintf(stderr, " | states built %llu (%.2f ms, %llu for the epoch)", static_cast<unsigned long long>(F.builds), F.build_ms,
-                     static_cast<unsigned long long>(F.builds_epoch));
+        std::fprintf(stderr, " | states built %llu (%.2f ms, %llu for the epoch, %llu from the memo)", static_cast<unsigned long long>(F.builds), F.build_ms,
+                     static_cast<unsigned long long>(F.builds_epoch), static_cast<unsigned long long>(F.memo_hits));
         std::fprintf(stderr, "\n");
     }
     T.shapes += F.shapes, T.drawn += F.drawn, T.skipped += F.skipped, T.clears += F.clears, T.draws += F.draws, T.passes += F.passes, T.pipelines += F.pipelines;
@@ -3719,7 +3830,7 @@ int g_sweep = 0;
 bool requested() { return false; }
 bool init(const Context &) { return false; }
 void shape(const State &, const std::uint32_t *, const std::uint32_t *, std::uint32_t, std::uint64_t, const Vertex *, int) {}
-void shapes(const State &, const std::uint32_t *, const std::uint32_t *, std::uint32_t, std::uint64_t, const Vertex *, int, int) {}
+void shapes(const State &, const std::uint32_t *, const std::uint32_t *, std::uint32_t, std::uint64_t, const Vertex *, int, const std::uint16_t *, int, int) {}
 bool batch_on() { return false; }
 void upload(const std::uint32_t *, const std::uint8_t *, std::size_t) {}
 void clut(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, bool, std::uint32_t, std::uint32_t, std::uint32_t) {}

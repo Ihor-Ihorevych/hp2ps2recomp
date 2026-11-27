@@ -5652,12 +5652,12 @@ static SetupCache &setup_of(const State &st, std::uint64_t attr) {
 
 // A run of primitives under one GS state (gs.cpp's PACKED runs, gs::flush_run): the setup once, then the hardware renderer takes them all
 // (hwr::shapes). Only used in hw mode (gs.cpp asks batch_wanted()).
-void draw_run(const State &st, const Vertex *v, int prims, int per) {
+void draw_run(const State &st, const Vertex *v, int nverts, const std::uint16_t *idx, int prims, int per) {
     if (g_image.active && !g_image.pending.empty()) flush_image();
     std::uint64_t attr = st.prim;
     if (!(st.prmodecont & 1u)) attr = (st.prim & 7u) | (st.prmode & ~7ull);
     const SetupCache &cache = setup_of(st, attr);
-    hwr::shapes(st, cache.setup, cache.mip, cache.mip_top, cache.serial, v, prims, per);
+    hwr::shapes(st, cache.setup, cache.mip, cache.mip_top, cache.serial, v, nverts, idx, prims, per);
 }
 
 bool batch_wanted() { return hwr::g_on && hwr::batch_on(); }

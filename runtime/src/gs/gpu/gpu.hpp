@@ -28,9 +28,9 @@ extern Mode g_current_mode;  // set by init(); read through mode() on every shap
 inline Mode mode() { return g_current_mode; }
 bool init(Mode m);
 void draw(const State &s, const Vertex *v, int count);
-// hw mode: `prims` primitives of `per` corners each under the GS state `s` (no register but the vertex ones written between them), as
-// draw() for each in order (hwr::shapes); batch_wanted() says whether gs.cpp may gather them so (PS2_RENDERER=hw, PS2_HWR_BATCH not 0)
-void draw_run(const State &s, const Vertex *v, int prims, int per);
+// hw mode: `prims` primitives of `per` corners each (v[idx[per*k + j]], or v[per*k + j] without idx) under the GS state `s` (no register
+// but the vertex ones written between them), as draw() for each in order (hwr::shapes); batch_wanted() says whether gs.cpp may gather them so (PS2_RENDERER=hw, PS2_HWR_BATCH not 0)
+void draw_run(const State &s, const Vertex *v, int nverts, const std::uint16_t *idx, int prims, int per);
 bool batch_wanted();
 void image_begin(const State &s);
 void image_data(const std::uint8_t *data, std::size_t bytes);
