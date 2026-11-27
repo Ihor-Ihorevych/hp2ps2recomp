@@ -32,6 +32,8 @@
 namespace ps2::hp2 {
 std::uint32_t stage_16d8(Vu0Regs &r, std::uint8_t *mem, bool guard);  // hp2_vu1.cpp: Harry Potter 2's native VU1 stages
 std::uint32_t stage_1c28(Vu0Regs &r, std::uint8_t *mem);              // hp2_vu1_skin.cpp: its skinning stage, fused
+bool is_dispatcher_entry(std::uint32_t pc);                           // hp2_vu1_disp.cpp: its dispatcher, fused, with the native stages
+std::int64_t run_batch(Vu0Regs &r, std::uint8_t *mem, std::uint32_t pc, bool guard, bool transform, bool skin);
 }
 
 namespace ps2::vu {
@@ -1325,6 +1327,11 @@ constexpr std::uint64_t kHp2Stage16D8 = 0xC4C61B5987BD7B14ull;
 // the skinning stage: its entry and the four programs its vertex loop jumps to (keys of the code from each entry)
 constexpr std::uint32_t kHp2SkinAt[5] = {0x1C28u, 0x1D60u, 0x1E10u, 0x1E88u, 0x1EE0u};
 constexpr std::uint64_t kHp2Skin[5] = {0x42D6E9811029E540ull, 0xDBBD1B44AFD983D1ull, 0xA7B0B0B00784674Full, 0xECDBBCCBC548F551ull, 0xA04B3E566A765F4Dull};
+// the dispatcher's six programs (hp2_vu1_disp.cpp)
+constexpr std::uint32_t kHp2DispAt[6] = {0x0000u, 0x0010u, 0x00D0u, 0x00E8u, 0x0108u, 0x0140u};
+constexpr std::uint64_t kHp2Disp[6] = {0xDEF947F9349C3D29ull, 0x7660DD038427F96Aull, 0x237A726C00444D23ull, 0xCFC5C86EDE01FAE5ull, 0x6F56360351382783ull,
+                                       0x0254F4B44E67191Full};
+bool hp2_disp_known();
 bool hp2_skin_known();  // below: the code at all five entries is the code the fused function was made from (keys known this code generation)
 void hp2_check_skin(ProgramFn compiled);
 std::uint64_t g_hp2_taken = 0, g_hp2_declined = 0;  // PS2_HP2_NATIVE_LOG=1: printed every 100 000 batches
@@ -1449,6 +1456,14 @@ void hp2_check(ProgramFn compiled) {
         std::fprintf(stderr, "[hp2-check] %llu runs of 16D8: %llu compared (%llu with differences so far), %llu declined, %llu clipped by the program\n",
                      static_cast<unsigned long long>(runs), static_cast<unsigned long long>(compared), static_cast<unsigned long long>(mismatches),
                      static_cast<unsigned long long>(declined), static_cast<unsigned long long>(clipped));
+}
+
+bool hp2_disp_known() {
+    for (int i = 0; i < 6; ++i) {
+        const EntryCache &c = g_entries[kHp2DispAt[i] >> 3];
+        if (c.generation != g_generation[1] || c.key != kHp2Disp[i]) return false;
+    }
+    return true;
 }
 
 // The skinning stage's five programs are all known with the keys the fused function was made from (an entry gets its key when the chain
@@ -1682,7 +1697,13 @@ void interpret_full(int unit, std::uint32_t pc) {
                 const prof::Scope prog_scope(prof::kVProg);
                 // Harry Potter 2's transform stage done natively (hp2_vu1.cpp); the compiled program when the stage declines the batch
                 const int hp2 = hp2_native_mode();
-                if (hp2 && (pc & 16383u) == 0x16D8u && e.key == kHp2Stage16D8) {
+                if (hp2 && hp2 != 3 && hp2::is_dispatcher_entry(pc & 16383u) && hp2_disp_known()) {
+                    // the whole batch from here (hp2_vu1_disp.cpp): the dispatcher fused, the native stages called directly
+                    const EntryCache &t = g_entries[0x16D8u >> 3];
+                    const bool transform = t.generation == g_generation[1] && t.key == kHp2Stage16D8;
+                    const std::int64_t next = hp2::run_batch(g_vu1, g_vu1_mem, pc & 16383u, hp2 == 1, transform, hp2_skin_known());
+                    if (next >= 0) g_chained = next;
+                } else if (hp2 && (pc & 16383u) == 0x16D8u && e.key == kHp2Stage16D8) {
                     if (hp2 == 3) {
                         hp2_check(e.function);
                     } else if (const std::uint32_t next = hp2::stage_16d8(g_vu1, g_vu1_mem, hp2 == 1)) {
