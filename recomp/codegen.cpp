@@ -118,7 +118,7 @@ private:
     std::optional<std::string> field(const Insn &i) const {
         const Link *l = link_at(i.pc);
         if (!l || (l->kind != Fix::High && l->kind != Fix::Low)) return std::nullopt;
-        if (l->external || !relocatable_) return std::format("static_cast<std::uint32_t>(ld16({}))", pc(i.pc));
+        if (l->external || !relocatable_) return std::format("static_cast<std::uint32_t>(ld16(c, {}))", pc(i.pc));
         if (l->kind == Fix::High) return std::format("((B + {}) >> 16)", hex(l->value + 0x8000u));
         return std::format("(B + {})", hex(i.uimm()));
     }
@@ -222,7 +222,7 @@ private:
         for (const auto &[a, id] : ids_[u]) dense[(a - base_) >> 2] = id;
         for (std::size_t k = 0; k < dense.size(); ++k) out_ << (k % 32 ? " " : "\n    ") << dense[k] << ",";
         out_ << "\n};\n\n";
-        out_ << "void " << unit_name(u) << "(Cpu &c, std::uint32_t entry, std::uint32_t depth) {\n";
+        out_ << "void " << unit_name(u) << "(Cpu &PS2_GEN_RESTRICT c, std::uint32_t entry, std::uint32_t depth) {\n";
         if (relocatable_) out_ << "    [[maybe_unused]] const std::uint32_t B = c.base;\n";
         out_ << "dispatch_entry:\n    switch (entry) {\n";
         for (const auto &[a, id] : ids_[u]) out_ << "    case " << id << "u: goto " << label(a) << ";\n";
@@ -309,7 +309,7 @@ private:
     void toggled(const Insn &i, const Toggle &t) {
         const Insn alt = decode(t.word, i.pc);
         if (flow(alt.op) != Flow::None || alt.op == Invalid) throw std::runtime_error(std::format("toggle at {:08X}: the other version is not a plain instruction", i.pc));
-        line(std::format("if (ld16({}) == {}u) {{", hex(t.cond_addr), t.value));
+        line(std::format("if (ld16(c, {}) == {}u) {{", hex(t.cond_addr), t.value));
         simple(alt);
         line("} else {");
         simple(i);
@@ -578,7 +578,7 @@ private:
         const std::string link = std::format("c.r[31].sd[0] = static_cast<std::int32_t>({});", pc(ret));
         const std::uint32_t t = i.branch_target_of();
         if (dynamic_jump(a)) {
-            const std::string target = std::format("const std::uint32_t t = (({} + 4u) & 0xF0000000u) | ((ld32({}) & 0x03FFFFFFu) << 2);", pc(a), pc(a));
+            const std::string target = std::format("const std::uint32_t t = (({} + 4u) & 0xF0000000u) | ((ld32(c, {}) & 0x03FFFFFFu) << 2);", pc(a), pc(a));
             if (i.op == Jal)
                 line(std::format("{{ {} {} {} call(c, t, depth + 1u); if (c.pc != {}) [[unlikely]] return; }}", target, link, slot, pc(ret)));
             else
@@ -796,37 +796,37 @@ private:
             if (const auto e = field(i)) set_d(rt, std::format("{} + static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int16_t>({})))", d(rs), *e));
             else set_d(rt, std::format("{} + static_cast<std::uint64_t>({}ll)", d(rs), i.simm()));
             break;
-        case Ldl: if (rt) line(std::format("ldl({}, {});", reg(rt), address(i))); break;
-        case Ldr: if (rt) line(std::format("ldr({}, {});", reg(rt), address(i))); break;
-        case Lwl: if (rt) line(std::format("lwl({}, {});", reg(rt), address(i))); break;
-        case Lwr: if (rt) line(std::format("lwr({}, {});", reg(rt), address(i))); break;
-        case Sdl: line(std::format("sdl({}, {});", reg(rt), address(i))); break;
-        case Sdr: line(std::format("sdr({}, {});", reg(rt), address(i))); break;
-        case Swl: line(std::format("swl({}, {});", reg(rt), address(i))); break;
-        case Swr: line(std::format("swr({}, {});", reg(rt), address(i))); break;
+        case Ldl: if (rt) line(std::format("ldl(c, {}, {});", reg(rt), address(i))); break;
+        case Ldr: if (rt) line(std::format("ldr(c, {}, {});", reg(rt), address(i))); break;
+        case Lwl: if (rt) line(std::format("lwl(c, {}, {});", reg(rt), address(i))); break;
+        case Lwr: if (rt) line(std::format("lwr(c, {}, {});", reg(rt), address(i))); break;
+        case Sdl: line(std::format("sdl(c, {}, {});", reg(rt), address(i))); break;
+        case Sdr: line(std::format("sdr(c, {}, {});", reg(rt), address(i))); break;
+        case Swl: line(std::format("swl(c, {}, {});", reg(rt), address(i))); break;
+        case Swr: line(std::format("swr(c, {}, {});", reg(rt), address(i))); break;
         case Lq:
-            if (rt) line(std::format("ld128({} & ~15u, {});", address(i), reg(rt)));
-            else line(std::format("{{ Reg128 scratch; ld128({} & ~15u, scratch); }}", address(i)));
+            if (rt) line(std::format("ld128(c, {} & ~15u, {});", address(i), reg(rt)));
+            else line(std::format("{{ Reg128 scratch; ld128(c, {} & ~15u, scratch); }}", address(i)));
             break;
-        case Sq: line(std::format("st128({} & ~15u, {});", address(i), reg(rt))); break;
-        case Lb: if (rt) line(std::format("c.r[{}].sd[0] = static_cast<std::int8_t>(ld8({}));", rt, address(i))); else line(std::format("(void)ld8({});", address(i))); break;
-        case Lbu: if (rt) line(std::format("c.r[{}].d[0] = ld8({});", rt, address(i))); else line(std::format("(void)ld8({});", address(i))); break;
-        case Lh: if (rt) line(std::format("c.r[{}].sd[0] = static_cast<std::int16_t>(ld16({}));", rt, address(i))); else line(std::format("(void)ld16({});", address(i))); break;
-        case Lhu: if (rt) line(std::format("c.r[{}].d[0] = ld16({});", rt, address(i))); else line(std::format("(void)ld16({});", address(i))); break;
-        case Lw: if (rt) line(std::format("set32(c.r[{}], ld32({}));", rt, address(i))); else line(std::format("(void)ld32({});", address(i))); break;
-        case Lwu: if (rt) line(std::format("c.r[{}].d[0] = ld32({});", rt, address(i))); else line(std::format("(void)ld32({});", address(i))); break;
-        case Ld: if (rt) line(std::format("c.r[{}].d[0] = ld64({});", rt, address(i))); else line(std::format("(void)ld64({});", address(i))); break;
-        case Sb: line(std::format("st8({}, static_cast<std::uint8_t>({}));", address(i), w(rt))); break;
-        case Sh: line(std::format("st16({}, static_cast<std::uint16_t>({}));", address(i), w(rt))); break;
-        case Sw: line(std::format("st32({}, {});", address(i), w(rt))); break;
-        case Sd: line(std::format("st64({}, {});", address(i), d(rt))); break;
-        case Lwc1: line(std::format("{} = ld32({});", f(i.ft()), address(i))); break;
-        case Swc1: line(std::format("st32({}, {});", address(i), f(i.ft()))); break;
+        case Sq: line(std::format("st128(c, {} & ~15u, {});", address(i), reg(rt))); break;
+        case Lb: if (rt) line(std::format("c.r[{}].sd[0] = static_cast<std::int8_t>(ld8(c, {}));", rt, address(i))); else line(std::format("(void)ld8(c, {});", address(i))); break;
+        case Lbu: if (rt) line(std::format("c.r[{}].d[0] = ld8(c, {});", rt, address(i))); else line(std::format("(void)ld8(c, {});", address(i))); break;
+        case Lh: if (rt) line(std::format("c.r[{}].sd[0] = static_cast<std::int16_t>(ld16(c, {}));", rt, address(i))); else line(std::format("(void)ld16(c, {});", address(i))); break;
+        case Lhu: if (rt) line(std::format("c.r[{}].d[0] = ld16(c, {});", rt, address(i))); else line(std::format("(void)ld16(c, {});", address(i))); break;
+        case Lw: if (rt) line(std::format("set32(c.r[{}], ld32(c, {}));", rt, address(i))); else line(std::format("(void)ld32(c, {});", address(i))); break;
+        case Lwu: if (rt) line(std::format("c.r[{}].d[0] = ld32(c, {});", rt, address(i))); else line(std::format("(void)ld32(c, {});", address(i))); break;
+        case Ld: if (rt) line(std::format("c.r[{}].d[0] = ld64(c, {});", rt, address(i))); else line(std::format("(void)ld64(c, {});", address(i))); break;
+        case Sb: line(std::format("st8(c, {}, static_cast<std::uint8_t>({}));", address(i), w(rt))); break;
+        case Sh: line(std::format("st16(c, {}, static_cast<std::uint16_t>({}));", address(i), w(rt))); break;
+        case Sw: line(std::format("st32(c, {}, {});", address(i), w(rt))); break;
+        case Sd: line(std::format("st64(c, {}, {});", address(i), d(rt))); break;
+        case Lwc1: line(std::format("{} = ld32(c, {});", f(i.ft()), address(i))); break;
+        case Swc1: line(std::format("st32(c, {}, {});", address(i), f(i.ft()))); break;
         case Lqc2:
-            if (i.ft()) line(std::format("ld128({} & ~15u, {});", address(i), vf(i.ft())));
-            else line(std::format("{{ Reg128 scratch; ld128({} & ~15u, scratch); }}", address(i)));
+            if (i.ft()) line(std::format("ld128(c, {} & ~15u, {});", address(i), vf(i.ft())));
+            else line(std::format("{{ Reg128 scratch; ld128(c, {} & ~15u, scratch); }}", address(i)));
             break;
-        case Sqc2: line(std::format("st128({} & ~15u, {});", address(i), vf(i.ft()))); break;
+        case Sqc2: line(std::format("st128(c, {} & ~15u, {});", address(i), vf(i.ft()))); break;
 
         case Plzcw: if (rd) line(std::format("mmi::plzcw({}, {});", reg(rd), reg(rs))); break;
         case Pmfhl: if (rd) line(std::format("mmi::pmfhl(c, {}, {}u);", reg(rd), sa)); break;

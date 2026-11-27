@@ -214,4 +214,131 @@ inline void sdr(const Reg128 &rt, std::uint32_t a) {
     st64(a & ~7u, (rt.d[0] << shift) | (mem & mask_below(shift)));
 }
 
+// The generated code's own memory accesses (recomp/codegen.cpp). A unit function takes the processor state as
+// `Cpu &PS2_GEN_RESTRICT c`: nothing but c reaches the state while the unit runs, so the compiler may keep guest registers and
+// the budget in host registers across guest loads and stores instead of writing them back after each one. Only the slow paths
+// can see the state behind the compiler's back (the INTC_STAT wait skip in hw.cpp compares g_cpu.r and moves g_cpu.budget, a timer
+// read takes the time from g_cpu.budget, request_iop_sync lowers the budget), so they are fenced: every cached value is written back
+// before the slow path and read again after it, and the game computes exactly what it did. Calls that take c are fences by themselves.
+// -DPS2_NO_GEN_RESTRICT (PS2_LIVE_FLAGS for a live library) leaves the state in memory as before, for comparisons.
+#if (defined(__clang__) || defined(__GNUC__)) && !defined(__EMSCRIPTEN__) && !defined(PS2_NO_GEN_RESTRICT)
+#define PS2_GEN_RESTRICT __restrict__
+inline void fence(Cpu &c) { asm volatile("" : : "r"(&c) : "memory"); }
+#else
+#define PS2_GEN_RESTRICT
+inline void fence(Cpu &) {}
+#endif
+
+inline std::uint8_t ld8(Cpu &c, std::uint32_t a) {
+    if (auto *p = fast<std::uint8_t>(a)) return *p;
+    fence(c);
+    const std::uint8_t v = slow_ld8(a);
+    fence(c);
+    return v;
+}
+
+inline std::uint16_t ld16(Cpu &c, std::uint32_t a) {
+    if (auto *p = fast<std::uint8_t>(a)) return load<std::uint16_t>(p);
+    fence(c);
+    const std::uint16_t v = slow_ld16(a);
+    fence(c);
+    return v;
+}
+
+inline std::uint32_t ld32(Cpu &c, std::uint32_t a) {
+    if (auto *p = fast<std::uint8_t>(a)) return load<std::uint32_t>(p);
+    fence(c);
+    const std::uint32_t v = slow_ld32(a);
+    fence(c);
+    return v;
+}
+
+inline std::uint64_t ld64(Cpu &c, std::uint32_t a) {
+    if (auto *p = fast<std::uint8_t>(a)) return load<std::uint64_t>(p);
+    fence(c);
+    const std::uint64_t v = slow_ld64(a);
+    fence(c);
+    return v;
+}
+
+inline void ld128(Cpu &c, std::uint32_t a, Reg128 &out) {
+    if (auto *p = fast<std::uint8_t>(a)) { std::memcpy(&out, p, 16); return; }
+    fence(c);
+    slow_ld128(a, out);
+    fence(c);
+}
+
+// A store: the common case as in st8..st128 above; anything else (the watch, scratchpad, registers, mirrors) takes the plain path fenced.
+#ifdef PS2_LIVE_EE
+#define PS2_GEN_STORE(T, plain)                                                    \
+    if (!g_watch_on) if (auto *p = fast<std::uint8_t>(a)) { store<T>(p, v); return; } \
+    fence(c);                                                                      \
+    plain(a, v);                                                                   \
+    fence(c);
+#else
+#define PS2_GEN_STORE(T, plain)                                                    \
+    if (a < g_store_ram_end) [[likely]] { store<T>(PS2_RAM + a, v); return; }       \
+    fence(c);                                                                      \
+    plain(a, v);                                                                   \
+    fence(c);
+#endif
+
+inline void st8(Cpu &c, std::uint32_t a, std::uint8_t v) { PS2_GEN_STORE(std::uint8_t, st8) }
+inline void st16(Cpu &c, std::uint32_t a, std::uint16_t v) { PS2_GEN_STORE(std::uint16_t, st16) }
+inline void st32(Cpu &c, std::uint32_t a, std::uint32_t v) { PS2_GEN_STORE(std::uint32_t, st32) }
+inline void st64(Cpu &c, std::uint32_t a, std::uint64_t v) { PS2_GEN_STORE(std::uint64_t, st64) }
+inline void st128(Cpu &c, std::uint32_t a, const Reg128 &v) { PS2_GEN_STORE(Reg128, st128) }
+#undef PS2_GEN_STORE
+
+inline void lwl(Cpu &c, Reg128 &rt, std::uint32_t a) {
+    const std::uint32_t shift = (3u - (a & 3u)) * 8u;
+    const std::uint32_t mem = ld32(c, a & ~3u);
+    const std::uint32_t v = (mem << shift) | (rt.w[0] & static_cast<std::uint32_t>(mask_below(shift)));
+    rt.sd[0] = static_cast<std::int32_t>(v);
+}
+
+inline void lwr(Cpu &c, Reg128 &rt, std::uint32_t a) {
+    const std::uint32_t shift = (a & 3u) * 8u;
+    const std::uint32_t mem = ld32(c, a & ~3u);
+    const std::uint32_t v = (mem >> shift) | (rt.w[0] & ~static_cast<std::uint32_t>(mask_below(32 - shift)));
+    if (shift == 0) rt.sd[0] = static_cast<std::int32_t>(v);
+    else rt.w[0] = v;
+}
+
+inline void ldl(Cpu &c, Reg128 &rt, std::uint32_t a) {
+    const std::uint32_t shift = (7u - (a & 7u)) * 8u;
+    const std::uint64_t mem = ld64(c, a & ~7u);
+    rt.d[0] = (mem << shift) | (rt.d[0] & mask_below(shift));
+}
+
+inline void ldr(Cpu &c, Reg128 &rt, std::uint32_t a) {
+    const std::uint32_t shift = (a & 7u) * 8u;
+    const std::uint64_t mem = ld64(c, a & ~7u);
+    rt.d[0] = (mem >> shift) | (rt.d[0] & ~mask_below(64 - shift));
+}
+
+inline void swl(Cpu &c, const Reg128 &rt, std::uint32_t a) {
+    const std::uint32_t shift = (3u - (a & 3u)) * 8u;
+    const std::uint32_t mem = ld32(c, a & ~3u);
+    st32(c, a & ~3u, (rt.w[0] >> shift) | (mem & ~static_cast<std::uint32_t>(mask_below(32 - shift))));
+}
+
+inline void swr(Cpu &c, const Reg128 &rt, std::uint32_t a) {
+    const std::uint32_t shift = (a & 3u) * 8u;
+    const std::uint32_t mem = ld32(c, a & ~3u);
+    st32(c, a & ~3u, (rt.w[0] << shift) | (mem & static_cast<std::uint32_t>(mask_below(shift))));
+}
+
+inline void sdl(Cpu &c, const Reg128 &rt, std::uint32_t a) {
+    const std::uint32_t shift = (7u - (a & 7u)) * 8u;
+    const std::uint64_t mem = ld64(c, a & ~7u);
+    st64(c, a & ~7u, (rt.d[0] >> shift) | (mem & ~mask_below(64 - shift)));
+}
+
+inline void sdr(Cpu &c, const Reg128 &rt, std::uint32_t a) {
+    const std::uint32_t shift = (a & 7u) * 8u;
+    const std::uint64_t mem = ld64(c, a & ~7u);
+    st64(c, a & ~7u, (rt.d[0] << shift) | (mem & mask_below(shift)));
+}
+
 }
