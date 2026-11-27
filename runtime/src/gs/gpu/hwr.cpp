@@ -241,6 +241,66 @@ struct Rect {
     int x0, y0, x1, y1;
     bool hits(const Rect &o) const { return x0 <= o.x1 && o.x0 <= x1 && y0 <= o.y1 && o.y0 <= y1; }
 };
+// What was drawn into a target since its copy, per pair of rows: the span of columns written (PS2_HWR_DIRTY_GRID, default on). Exact
+// enough that a run of strips that reads rows the run has not written yet (Harry Potter 2 moves its 704x576 effect buffer up by 2 rows:
+// 64x2 strips going down each 64-pixel column, each reading the 2 rows below) needs no new copy: the rectangle lists merged those strips
+// into one box per column once they were 32, so every column made a copy and broke the render pass (11 passes of that buffer a frame).
+// A row's span only grows (two writes far apart in one row cover what lies between: conservative).
+struct DirtyGrid {
+    static constexpr int kCw = 1, kCh = 2;
+    std::vector<int> lo, hi;  // per row pair: columns written [lo, hi], lo > hi: none
+    int rows = 0, n = 0;      // n: row pairs with a span
+    void clear() {
+        if (n) std::fill(lo.begin(), lo.end(), 1 << 30), std::fill(hi.begin(), hi.end(), -1);
+        n = 0;
+    }
+    void fit(int, int h) {
+        const int nr = (h + kCh - 1) / kCh;
+        if (nr != rows) rows = nr, lo.assign(static_cast<std::size_t>(nr), 1 << 30), hi.assign(static_cast<std::size_t>(nr), -1), n = 0;
+    }
+    bool span(const Rect &r, int &y0, int &y1) const {
+        y0 = std::max(r.y0, 0) / kCh, y1 = std::min(r.y1 / kCh, rows - 1);
+        return r.y1 >= 0 && r.x1 >= 0 && y0 <= y1 && r.x0 <= r.x1;
+    }
+    void mark(const Rect &r) {
+        int y0, y1;
+        if (!span(r, y0, y1)) return;
+        const int x0 = std::max(r.x0, 0);
+        for (int y = y0; y <= y1; ++y) {
+            if (lo[static_cast<std::size_t>(y)] > hi[static_cast<std::size_t>(y)]) ++n;
+            lo[static_cast<std::size_t>(y)] = std::min(lo[static_cast<std::size_t>(y)], x0), hi[static_cast<std::size_t>(y)] = std::max(hi[static_cast<std::size_t>(y)], r.x1);
+        }
+    }
+    bool hits(const Rect &r) const {
+        int y0, y1;
+        if (!n || !span(r, y0, y1)) return false;
+        for (int y = y0; y <= y1; ++y)
+            if (lo[static_cast<std::size_t>(y)] <= r.x1 && r.x0 <= hi[static_cast<std::size_t>(y)]) return true;
+        return false;
+    }
+    Rect bbox() const {  // of what is written (pixels); x1 < 0 when nothing
+        Rect b{1 << 30, 1 << 30, -1, -1};
+        if (!n) return b;
+        for (int y = 0; y < rows; ++y)
+            if (lo[static_cast<std::size_t>(y)] <= hi[static_cast<std::size_t>(y)])
+                b.x0 = std::min(b.x0, lo[static_cast<std::size_t>(y)]), b.x1 = std::max(b.x1, hi[static_cast<std::size_t>(y)]), b.y0 = std::min(b.y0, y * kCh),
+                b.y1 = std::max(b.y1, y * kCh + kCh - 1);
+        return b;
+    }
+    void unmark(const Rect &r) {  // r row-pair aligned (or reaching past the last row): what it covers is clean
+        int y0, y1;
+        if (!n || !span(r, y0, y1)) return;
+        for (int y = y0; y <= y1; ++y) {
+            int &l = lo[static_cast<std::size_t>(y)], &h = hi[static_cast<std::size_t>(y)];
+            if (l > h || h < r.x0 || r.x1 < l) continue;
+            if (r.x0 <= l && h <= r.x1) l = 1 << 30, h = -1, --n;
+            else if (r.x0 <= l) l = r.x1 + 1;
+            else if (h <= r.x1) h = r.x0 - 1;
+        }
+    }
+};
+const bool g_dirty_grid = os::env("PS2_HWR_DIRTY_GRID") != "0";
+
 struct Target {
     u32 bp = 0, bw = 0, psm = 0;  // psm: the class for lookups (CT32 for CT24); depth targets keep their Z format
     u32 last_psm = 0;             // the format last drawn (CT24 keeps the top byte when written back)
@@ -255,6 +315,7 @@ struct Target {
     std::vector<Rect> dirty;      // what was drawn into the surface since the copy
     std::vector<Rect> dirty_a;    // the part of it whose alpha was written (a draw that reads only the copy's alpha, view 3, needs no new copy for the rest)
     std::vector<Tri> date_tris;   // DATE draws' alpha writes since the copy, as triangles: a DATE draw that overlaps none of them needs no new copy
+    DirtyGrid grid, grid_a;       // dirty and dirty_a as cells (g_dirty_grid)
     std::vector<u64> page_snap_frame;  // view-4 self reads: per page of the target, the frame its part of the copy was brought up to date in
                                        // (+1; read as of then for the rest of that frame, as store_for_memory once_per_frame writes a page back)
     u64 writes = 0, stored = ~0ull;  // draws into it so far, and how many of them the last write-back to memory (store_for_memory) had
@@ -669,6 +730,8 @@ void drop_snap(Target &t) {
     t.snap = t.snap_of = nullptr;
     t.dirty.clear();
     t.dirty_a.clear();
+    t.grid.clear();
+    t.grid_a.clear();
     t.date_tris.clear();
     if (g_date_open_target >= 0 && g_targets[static_cast<std::size_t>(g_date_open_target)].get() == &t)
         g_date_open_tris.clear(), g_date_open_draw = ~std::size_t{0}, g_date_open_target = -1;
@@ -1593,6 +1656,12 @@ void note_write(Target &t, int x0, int y0, int x1, int y1, bool alpha) {
     ++t.writes;
     if (!t.snap) return;
     const Rect r{x0, y0, x1, y1};
+    if (g_dirty_grid) {
+        t.grid.fit(static_cast<int>(t.w), static_cast<int>(t.h));
+        t.grid.mark(r);
+        if (alpha) t.grid_a.fit(static_cast<int>(t.w), static_cast<int>(t.h)), t.grid_a.mark(r);
+        return;
+    }
     add_dirty(t.dirty, r);
     if (alpha) add_dirty(t.dirty_a, r);
 }
@@ -1614,7 +1683,8 @@ void flush_date_tris(Target &t) {
     for (const Tri &q : t.date_tris) {
         const Rect r{static_cast<int>(std::floor(std::min({q.x[0], q.x[1], q.x[2]}))), static_cast<int>(std::floor(std::min({q.y[0], q.y[1], q.y[2]}))),
                      static_cast<int>(std::ceil(std::max({q.x[0], q.x[1], q.x[2]}))), static_cast<int>(std::ceil(std::max({q.y[0], q.y[1], q.y[2]})))};
-        add_dirty(t.dirty_a, r);
+        if (g_dirty_grid) t.grid_a.fit(static_cast<int>(t.w), static_cast<int>(t.h)), t.grid_a.mark(r);
+        else add_dirty(t.dirty_a, r);
     }
     t.date_tris.clear();
 }
@@ -1646,7 +1716,7 @@ WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res, bool alpha_only, bool f
             op.tgt = ti;
             ++F.self_copies;
             F.copy_bytes += static_cast<u64>(card_x(t.w, t.sc)) * card_y(t.h, t.sc) * 4;
-            t.dirty.clear(), t.dirty_a.clear();
+            t.dirty.clear(), t.dirty_a.clear(), t.grid.clear(), t.grid_a.clear();
             std::fill(t.page_snap_frame.begin(), t.page_snap_frame.end(), 0);
         }
         bool stale = false;
@@ -1683,8 +1753,10 @@ WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res, bool alpha_only, bool f
         return t.snap->sample_group;
     }
     bool fresh = t.snap && t.snap_of == t.s;
-    if (fresh)
-        for (const Rect &d : alpha_only && alpha_snap ? t.dirty_a : t.dirty)
+    const bool use_a = alpha_only && alpha_snap;
+    if (fresh && g_dirty_grid) fresh = !(use_a ? t.grid_a : t.grid).hits(r);
+    else if (fresh)
+        for (const Rect &d : use_a ? t.dirty_a : t.dirty)
             if (d.hits(r)) {
                 fresh = false;
                 break;
@@ -1697,8 +1769,17 @@ WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res, bool alpha_only, bool f
     Rect pr{std::max(r.x0, 0), std::max(r.y0, 0), std::min(r.x1, vw - 1), std::min(r.y1, vh - 1)};
     // the part copied reaches over all the rows of the written rectangles it meets, so that they can be cut back to what lies beside it
     // (one copy for a column of strips, not one per strip)
-    if (!fresh && partial)
-        for (const Rect &d : alpha_only && alpha_snap ? t.dirty_a : t.dirty)
+    if (!fresh && partial && g_dirty_grid) {  // the cells the read touches (the grid's cells are cleaned whole)
+        // everything written since the copy too: the draws after this one then need no copy each (a run of strips that reads rows written
+        // before the run, a run of DATE shapes)
+        {
+            const Rect b = (use_a ? t.grid_a : t.grid).bbox();
+            if (b.x1 >= 0) pr.x0 = std::min(pr.x0, b.x0), pr.y0 = std::min(pr.y0, b.y0), pr.x1 = std::min(vw - 1, std::max(pr.x1, b.x1)), pr.y1 = std::min(vh - 1, std::max(pr.y1, b.y1));
+        }
+        pr.x0 -= pr.x0 % DirtyGrid::kCw, pr.y0 -= pr.y0 % DirtyGrid::kCh;
+        pr.x1 = std::min(vw - 1, pr.x1 - pr.x1 % DirtyGrid::kCw + DirtyGrid::kCw - 1), pr.y1 = std::min(vh - 1, pr.y1 - pr.y1 % DirtyGrid::kCh + DirtyGrid::kCh - 1);
+    } else if (!fresh && partial)
+        for (const Rect &d : use_a ? t.dirty_a : t.dirty)
             if (d.hits(pr)) {
                 pr.y0 = std::max(0, std::min(pr.y0, d.y0)), pr.y1 = std::min(vh - 1, std::max(pr.y1, d.y1));
                 // a DATE draw: the whole written rectangle (its columns too), so that it is clean afterwards (the next DATE shapes beside it
@@ -1722,6 +1803,14 @@ WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res, bool alpha_only, bool f
             op.tgt = ti;
             ++F.self_copies;
             F.copy_bytes += static_cast<u64>(op.w) * op.h * 4;
+            if (g_dirty_grid) {
+                // cells cut by the valid area's edge count as copied whole (nothing outside it is read)
+                const Rect cr{pr.x0, pr.y0, pr.x1 + 1 >= vw ? 1 << 30 : pr.x1, pr.y1 + 1 >= vh ? 1 << 30 : pr.y1};
+                t.grid.unmark(cr);
+                t.grid_a.unmark(cr);
+                res = t.snap->id;
+                return t.snap->sample_group;
+            }
             const auto inside = [&](const Rect &d) { return d.x0 >= pr.x0 && d.x1 <= pr.x1 && d.y0 >= pr.y0 && d.y1 <= pr.y1; };
             t.dirty.erase(std::remove_if(t.dirty.begin(), t.dirty.end(), inside), t.dirty.end());
             t.dirty_a.erase(std::remove_if(t.dirty_a.begin(), t.dirty_a.end(), inside), t.dirty_a.end());
@@ -2335,7 +2424,7 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
         const u64 copies = F.self_copies;
         self_copy(s.color, Rect{x0, y0, x1, y1}, res2, true, false, true);
         if (F.self_copies != copies || overlap) date_join = false;
-        if (g_dump_now) std::fprintf(stderr, "[hwr-dump] date rev %d join %d overlap %d copied %d tris %zu open %zu dirty_a %zu snap %d\n", date_rev ? 1 : 0, date_join ? 1 : 0, overlap ? 1 : 0, F.self_copies != copies ? 1 : 0, ct.date_tris.size(), g_date_open_tris.size(), ct.dirty_a.size(), ct.snap_of == ct.s ? 1 : 0);
+        if (g_dump_now) std::fprintf(stderr, "[hwr-dump] date rev %d join %d overlap %d copied %d tris %zu open %zu dirty_a %zu snap %d\n", date_rev ? 1 : 0, date_join ? 1 : 0, overlap ? 1 : 0, F.self_copies != copies ? 1 : 0, ct.date_tris.size(), g_date_open_tris.size(), static_cast<std::size_t>(ct.grid_a.n), ct.snap_of == ct.s ? 1 : 0);
         if (!date_join && g_date_open_target >= 0) {  // the open reversed draw is closed: its triangles are an earlier draw's now
             if (g_targets[static_cast<std::size_t>(g_date_open_target)]) {
                 Target &ot = *g_targets[static_cast<std::size_t>(g_date_open_target)];
@@ -2365,9 +2454,10 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
     ensure_pass(s);
     Op &pass = g_ops[static_cast<std::size_t>(g_open_pass)];
     if (g_dump_now && (s.src.target >= 0 || prim == 6 || s.date))
-        std::fprintf(stderr, "[hwr-dump] shape t%d %04x/%u prim %u rect %d,%d-%d,%d src t%d view %u uv %d,%d-%d,%d tbp %04x blend %d mask %x zw %d atest %u clearpart %d date %d aw %d copies %llu\n", s.color, ct.bp, ct.bw, prim, x0, y0, x1,
+        std::fprintf(stderr, "[hwr-dump] shape t%d %04x/%u prim %u rect %d,%d-%d,%d src t%d view %u uv %d,%d-%d,%d tbp %04x blend %d mask %x zw %d atest %u clearpart %d date %d aw %d copies %llu xy16 %d,%d-%d,%d uv16 %d,%d-%d,%d flags %05X\n", s.color, ct.bp, ct.bw, prim, x0, y0, x1,
                      y1, s.src.target, s.src.view, v[0].u >> 4, v[0].v >> 4, v[1].u >> 4, v[1].v >> 4, w[12], s.k1.blend, s.k1.mask, s.k1.zwrite, s.k1.atest, clear_part, s.date ? 1 : 0,
-                     s.awrite_any ? 1 : 0, static_cast<unsigned long long>(F.self_copies));
+                     s.awrite_any ? 1 : 0, static_cast<unsigned long long>(F.self_copies), static_cast<int>(px[0] * 16), static_cast<int>(py[0] * 16), static_cast<int>(px[1] * 16),
+                     static_cast<int>(py[1] * 16), static_cast<int>(v[0].u), static_cast<int>(v[0].v), static_cast<int>(v[1].u), static_cast<int>(v[1].v), flags);
     // corners in clip space (GS pixel x is the centre of the card's pixel x), as triangles
     const u32 first = static_cast<u32>(g_verts.size());
     const bool fst = flags & 16u, iip = flags & 1u;
