@@ -55,10 +55,16 @@ void note_device(const char *text) {
     g_headroom.store(d.headroom, std::memory_order_relaxed);
     const bool hot = device_hot(d);
     if (hot != g_hot.exchange(hot, std::memory_order_relaxed))
-        std::fprintf(stderr, "[governor] the phone is %s (thermal status %d, headroom %.2f)\n", hot ? "hot: pictures may be skipped" : "cool again", d.status, static_cast<double>(d.headroom));
+        std::fprintf(stderr, "[governor] the phone is %s (thermal status %d, headroom %.2f)\n", hot ? "hot" : "cool again", d.status, static_cast<double>(d.headroom));
 }
 
-bool behind() { return g_pace_behind.load(std::memory_order_relaxed) || g_hot.load(std::memory_order_relaxed); }
+// Only falling behind skips pictures: heat alone does not (on the phone the headroom sat at 0.89-0.91, on the line, and skipping went on
+// and off every few seconds while the game kept full speed: half the pictures for nothing). A phone that heat slows down falls behind,
+// and that is seen. PS2_FRAMESKIP_HOT=1: heat counts as behind too (the earlier rule).
+bool behind() {
+    static const bool hot_counts = os::env("PS2_FRAMESKIP_HOT") == "1";
+    return g_pace_behind.load(std::memory_order_relaxed) || (hot_counts && g_hot.load(std::memory_order_relaxed));
+}
 
 bool skip_picture() {
     g_skip.mode = mode();

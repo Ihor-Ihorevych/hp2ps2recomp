@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 
 namespace ps2::governor {
 
@@ -27,10 +28,17 @@ struct Device {
 inline Device parse_device(const char *text) {
     Device d;
     if (!text) return d;
-    if (const char *p = std::strstr(text, "thermal status ")) {
+    // "thermal status 2" (SpikeActivity) or "thermal 2" (Ps2Activity.deviceNote)
+    for (const char *key : {"thermal status ", "thermal "}) {
+        const char *p = std::strstr(text, key);
+        if (!p) continue;
+        const std::size_t n = std::strlen(key);
         char *end = nullptr;
-        const long v = std::strtol(p + 15, &end, 10);
-        if (end != p + 15) d.status = static_cast<int>(v);
+        const long v = std::strtol(p + n, &end, 10);
+        if (end != p + n) {
+            d.status = static_cast<int>(v);
+            break;
+        }
     }
     if (const char *p = std::strstr(text, "headroom ")) {
         char *end = nullptr;
@@ -45,30 +53,33 @@ inline Device parse_device(const char *text) {
 inline bool device_hot(const Device &d) { return d.status >= 3 || d.headroom >= 0.9f; }
 
 // The speed limiter's view, a window of fields at a time: `slack_ms` is what the limiter waited at a field (negative: the field came
-// that late), `restarted` that it gave up catching up (the game fell several fields behind). Behind when the fields left under 5 % of
-// their time unused, or the clock had to restart, or the sound was being stretched; caught up again after two windows with 25 % unused
-// (skipping itself frees time, so the bar to stop is higher than the bar to start).
+// that late), `restarted` that it gave up catching up (the game fell several fields behind). Behind only when the game really lost time:
+// the clock had to restart, the sound was being stretched, or the fields of a whole window came more than a period late on average.
+// Little or no wait is not behind: a game at full load (Harry Potter 2 draws in one field and none in the next, so the drawn field comes
+// late and the next one on time) keeps real time; skipping then only halves the pictures (the phone showed 50 fields a second and a
+// quarter of the pictures skipped under the earlier "under 5 % unused" rule). Caught up again after two windows that lost no time and
+// came less than half a period late on average.
 struct Pace {
     static constexpr int kWindow = 25;  // fields (half a second PAL)
     int fields = 0, calm = 0;
-    double spare = 0, period = 0;
+    double slack = 0, period = 0;
     bool late = false;  // a restart or stretched sound in this window
     bool behind = false;
     void field(double slack_ms, double period_ms, bool restarted, bool stretched) {
-        spare += slack_ms > 0 ? slack_ms : 0;
+        slack += slack_ms;
         period += period_ms;
         late = late || restarted || stretched;
         if (++fields < kWindow) return;
-        const double unused = period > 0 ? spare / period : 1.0;
-        if (late || unused < 0.05) {
+        const double avg = slack / kWindow, per = period / kWindow;
+        if (late || avg < -per) {
             behind = true;
             calm = 0;
-        } else if (unused >= 0.25) {
+        } else if (avg > -per / 2) {
             if (++calm >= 2) behind = false;
         } else {
             calm = 0;
         }
-        fields = 0, spare = 0, period = 0, late = false;
+        fields = 0, slack = 0, period = 0, late = false;
     }
 };
 

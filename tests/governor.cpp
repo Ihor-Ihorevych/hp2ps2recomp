@@ -37,17 +37,18 @@ int main() {
     {
         Pace p;
         check(!run(p, 4, 8.0), "8 ms of 20 left each field: keeping up");
-        check(run(p, 1, 0.5), "0.5 ms of 20 left: behind after one window");
-        check(run(p, 1, 3.0), "15 % left: still behind (between the bars)");
-        check(run(p, 1, 8.0), "40 % left once: still behind (two windows needed)");
-        check(!run(p, 1, 8.0), "40 % left twice: keeping up again");
+        check(!run(p, 1, 0.5), "0.5 ms of 20 left: still keeping up (no time lost)");
+        check(run(p, 1, -25.0), "fields 25 ms late on average: behind after one window");
+        check(run(p, 1, -15.0), "15 ms late on average: still behind (between the bars)");
+        check(run(p, 1, 2.0), "on time once: still behind (two windows needed)");
+        check(!run(p, 1, 2.0), "on time twice: keeping up again");
         check(run(p, 1, 8.0, true), "a restart of the clock is behind, whatever is left");
         Pace q;
         check(run(q, 1, 8.0, false, true), "stretched sound is behind");
         Pace r;
-        // Harry Potter 2: a drawn field takes two periods, the empty one after it none: no wait at all at full load
+        // Harry Potter 2: a drawn field takes two periods, the empty one after it none: full load, but real time is kept
         for (int i = 0; i < Pace::kWindow; ++i) r.field(i % 2 ? 0.0 : -19.0, 20.0, false, false);
-        check(r.behind, "no wait in a whole window: behind");
+        check(!r.behind, "full load at full speed (late drawn field, on-time empty one): not behind");
     }
     {
         Skipper s;
