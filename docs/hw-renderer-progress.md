@@ -298,3 +298,34 @@ App version 1.1 (AndroidManifest versionName, versionCode 2), shown under the ti
   17 -> 31.6 (each character's shadow run is a 0x2F20 pass with the frame's depth, between the passes of its shadow target).
 * Switches: `PS2_HWR_DATE=0` (DATE shapes not drawn, as before), `PS2_HWR_DATE_REVERSE=0` (no reversed draws), `PS2_HWR_DATE_TRIS=0`
   (any DATE alpha write under a shape's rectangle makes a new copy).
+
+## M6: texture decodes and render passes (2026-11-27)
+
+* **Texture decodes, measured** (heads scene, PS2_HWR_LOG=4, per drawn frame): 78 misses, 934 k texels, 228 mip levels. 58 of them
+  (690 k texels, 174 levels) are FROM-TARGET: mip chains the game renders into the frame's corner (address 0, T8/T4) and reads back,
+  written back to memory and decoded each frame; 10 more (118 k texels) read pages a target drew into (STALE). Only 10 textures (126 k
+  texels, 27 levels) are uploaded data. Card cost on the PC (PS2_HWR_TIME): the decode compute pass ~0.36 ms (with the uploads and
+  palette loads), ~105 level copies ~0.85 ms (timed with two empty compute passes each, so inflated). A decode on the processor is not done:
+  hw mode keeps no processor copy of graphics memory or of the palettes (gs.cpp g_memory is only kept for the processor rasterizer), and
+  88 % of the texels come from pictures that only the card holds, so it could serve 13 % of the work while adding a memory mirror and the
+  decode to the drawing thread, which is the busy one. PS2_HWR_DIRECT_MIPMAP=1 (view 4 for mipmapped reads) changes nothing here (same
+  counts, same frames): the corner's levels are not all held by the frame target.
+* **Dirty spans** (`PS2_HWR_DIRTY_GRID`, default on): what was drawn into a target since its copy is kept per pair of rows as a column
+  span (DirtyGrid). The rectangle lists merged HP2's 64x2 shift strips (the 704x576 buffer at 0x2F20 moved up 2 rows, reading the rows
+  below) into one box per column once they were 32, so each 64-pixel column made a copy and a render pass of the buffer. A copy made for a
+  stale read also takes everything written since the last copy.
+* **Read snapshots** (`PS2_HWR_READ_SNAP`, default on): a draw into a target at least 4 times larger than the target it reads (DATE
+  shadows into 0x2F20 reading each character's 128x128 shadow target at 0x3B80) reads a copy of the small target made at that point
+  (64-128 KB), so the large target's draws need not come before the small target's later draws.
+* **Schedule** (`PS2_HWR_SCHED_COPIES`, default on): when choosing the next render pass, copies whose inputs are reachable count as
+  reachable, so a small target that reads copies of itself counts as complete and is drawn before a large target's node that came first in
+  the stream. The 12 shadow targets now come before the frame's and 0x2F20's late passes; 0x2F20's DATE runs are 2 passes instead of 5.
+* DATE overlap test: the triangle lists keep their bounding box (TriList), limit 4096 triangles (was 256, which made a copy at the start
+  of every character's run).
+* Numbers (heads scene, per drawn frame, PS2_HWR_LOG): DATE skipped (as before): 43 passes, 27.6 / 26.6 MB loaded / stored, 17 self
+  copies (all switches above change nothing there). DATE drawn, old structure (PS2_HWR_DIRTY_GRID=0 PS2_HWR_READ_SNAP=0
+  PS2_HWR_SCHED_COPIES=0): 60-63 passes, 54-60 / 53-59 MB, 29-32 copies. DATE drawn, new: 49 passes, 35.5 / 34.5 MB, 23 copies
+  (4.2 MB). Frames 5600/5700/5800 bit-identical in every configuration.
+* Left: the frame (0000, 704x576 with depth) is still cut into ~7 passes (~6 MB of attachment traffic each): three write-backs to memory
+  for the corner's mip chains (anchored among the compute work) and the late 0x2F20 passes between; WebGPU's read-only depth is loaded
+  and stored by wgpu anyway (wgpu-core maps it to Load + Store), so it saves nothing.

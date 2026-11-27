@@ -237,6 +237,25 @@ u64 g_res = 1;                                     // resource id counter (surfa
 struct Tri {
     float x[3], y[3];
 };
+// triangles with their bounding box (a quick test before the separating-axis test of each one)
+struct TriList {
+    std::vector<Tri> v;
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    std::size_t size() const { return v.size(); }
+    bool empty() const { return v.empty(); }
+    void clear() { v.clear(), x0 = y0 = 1e30f, x1 = y1 = -1e30f; }
+    void push_back(const Tri &t) {
+        v.push_back(t);
+        for (int k = 0; k < 3; ++k) x0 = std::min(x0, t.x[k]), x1 = std::max(x1, t.x[k]), y0 = std::min(y0, t.y[k]), y1 = std::max(y1, t.y[k]);
+    }
+    void append(const TriList &o) {
+        for (const Tri &t : o.v) push_back(t);
+    }
+    bool box_hits(const Tri &t) const {
+        const float a0 = std::min({t.x[0], t.x[1], t.x[2]}), a1 = std::max({t.x[0], t.x[1], t.x[2]}), b0 = std::min({t.y[0], t.y[1], t.y[2]}), b1 = std::max({t.y[0], t.y[1], t.y[2]});
+        return !v.empty() && a0 < x1 && x0 < a1 && b0 < y1 && y0 < b1;
+    }
+};
 struct Rect {
     int x0, y0, x1, y1;
     bool hits(const Rect &o) const { return x0 <= o.x1 && o.x0 <= x1 && y0 <= o.y1 && o.y0 <= y1; }
@@ -314,8 +333,11 @@ struct Target {
     Surf *snap_of = nullptr;      // the surface it was copied from
     std::vector<Rect> dirty;      // what was drawn into the surface since the copy
     std::vector<Rect> dirty_a;    // the part of it whose alpha was written (a draw that reads only the copy's alpha, view 3, needs no new copy for the rest)
-    std::vector<Tri> date_tris;   // DATE draws' alpha writes since the copy, as triangles: a DATE draw that overlaps none of them needs no new copy
+    TriList date_tris;            // DATE draws' alpha writes since the copy, as triangles: a DATE draw that overlaps none of them needs no new copy
     DirtyGrid grid, grid_a;       // dirty and dirty_a as cells (g_dirty_grid)
+    Surf *rsnap = nullptr;        // a copy of the picture read by draws into a larger target (read_snapshot), of surface rsnap_of after rsnap_writes draws
+    Surf *rsnap_of = nullptr;
+    u64 rsnap_writes = 0;
     std::vector<u64> page_snap_frame;  // view-4 self reads: per page of the target, the frame its part of the copy was brought up to date in
                                        // (+1; read as of then for the rest of that frame, as store_for_memory once_per_frame writes a page back)
     u64 writes = 0, stored = ~0ull;  // draws into it so far, and how many of them the last write-back to memory (store_for_memory) had
@@ -323,7 +345,7 @@ struct Target {
 };
 std::vector<std::unique_ptr<Target>> g_targets;
 // the DATE draw being recorded in reverse (DrawRec::rev): its triangles, its index in g_draws and its target
-std::vector<Tri> g_date_open_tris;
+TriList g_date_open_tris;
 std::size_t g_date_open_draw = ~std::size_t{0};
 int g_date_open_target = -1;
 std::vector<WGPUTexture> g_release_tex;
@@ -743,6 +765,8 @@ void release_target(int i) {
     t.alive = false;
     retire(t.s);
     drop_snap(t);
+    retire(t.rsnap);
+    t.rsnap = t.rsnap_of = nullptr;
     for (int k = 0; k < static_cast<int>(kPages); ++k)
         if (g_owner[k] == i) g_owner[k] = -1;
     g_dead_slots.push_back(i);
@@ -1675,12 +1699,12 @@ void add_dirty(std::vector<Rect> &list, const Rect &r);
 // the DATE draws' written triangles become written rectangles (a reader that is not a DATE draw, or a DATE draw that overlaps them)
 void flush_date_tris(Target &t) {
     if (g_date_open_target >= 0 && g_targets[static_cast<std::size_t>(g_date_open_target)].get() == &t) {
-        t.date_tris.insert(t.date_tris.end(), g_date_open_tris.begin(), g_date_open_tris.end());
+        t.date_tris.append(g_date_open_tris);
         g_date_open_tris.clear();
         g_date_open_draw = ~std::size_t{0};
         g_date_open_target = -1;
     }
-    for (const Tri &q : t.date_tris) {
+    for (const Tri &q : t.date_tris.v) {
         const Rect r{static_cast<int>(std::floor(std::min({q.x[0], q.x[1], q.x[2]}))), static_cast<int>(std::floor(std::min({q.y[0], q.y[1], q.y[2]}))),
                      static_cast<int>(std::ceil(std::max({q.x[0], q.x[1], q.x[2]}))), static_cast<int>(std::ceil(std::max({q.y[0], q.y[1], q.y[2]})))};
         if (g_dirty_grid) t.grid_a.fit(static_cast<int>(t.w), static_cast<int>(t.h)), t.grid_a.mark(r);
@@ -1851,6 +1875,36 @@ WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res, bool alpha_only, bool f
     return t.snap->sample_group;
 }
 
+// A draw into a large target that reads a small one (Harry Potter 2's shadows: each character's 128x128 shadow target at 0x3B80 read by
+// DATE shapes into the 704x576 buffer at 0x2F20, between that shadow target's own draws) reads a copy of it made at that point: then the
+// large target's draws do not have to come before the small target's later draws, and the schedule keeps them in fewer render passes
+// (each pass of a 704x576 target and its depth loads and stores ~6 MB on a tile GPU; the copy is 64-128 KB). The copy is made again when
+// the small target was drawn into since. PS2_HWR_READ_SNAP=0 turns it off.
+const bool g_read_snap = os::env("PS2_HWR_READ_SNAP") != "0";
+WGPUBindGroup read_snapshot(int ti, u64 &res) {
+    Target &t = *g_targets[static_cast<std::size_t>(ti)];
+    if (!t.rsnap || t.rsnap_of != t.s || t.rsnap_writes != t.writes) {
+        retire(t.rsnap);
+        t.rsnap = get_surf(t.w, t.h, false, t.sc);
+        t.rsnap_of = t.s;
+        t.rsnap_writes = t.writes;
+        const u32 w = static_cast<u32>(std::clamp<int>(t.valid_w, 1, static_cast<int>(t.w))), h = static_cast<u32>(std::clamp<int>(t.valid_h, 1, static_cast<int>(t.h)));
+        Op &op = add_op(kOpSelfCopy);
+        op.tex = t.s->tex;
+        op.tex2 = t.rsnap->tex;
+        op.w = w;
+        op.h = h;
+        op.sc = t.sc;
+        op.rd = t.s->id;
+        op.wr = t.rsnap->id;
+        op.tgt = ti;
+        ++F.self_copies;
+        F.copy_bytes += static_cast<u64>(card_x(w, t.sc)) * card_y(h, t.sc) * 4;
+    }
+    res = t.rsnap->id;
+    return t.rsnap->sample_group;
+}
+
 // the texels a shape can read from a target (texel loads, docs: TEX=2): from the corners' coordinates for FST shapes, else all of it
 Rect read_rect(const u32 *w, const Vertex *v, int n, int tw, int th) {
     const u32 flags = w[0], modes = w[7];
@@ -1886,7 +1940,7 @@ Rect read_rect(const u32 *w, const Vertex *v, int n, int tw, int th) {
 // order only when no two shapes of the draw cover the same pixel, so a draw takes a shape only when it overlaps none of the draw's shapes
 // (separating axis test on the triangles; shapes that only touch along an edge or a corner share no pixel). At most kSplitTris per draw.
 std::vector<Tri> g_split_tris;
-constexpr std::size_t kDateTris = 256;  // DATE triangles kept per target before a new copy is made anyway (the overlap test's cost)
+constexpr std::size_t kDateTris = 4096;  // DATE triangles kept per target before a new copy is made anyway (the overlap test's cost)
 constexpr std::size_t kSplitTris = 96;
 
 bool separated(const Tri &a, const Tri &b) {
@@ -2370,6 +2424,9 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
             }
             group = self_copy(s.src.target, rr, res, s.src.view == 3, s.src.view == 4);
         }
+        else if (g_read_snap && s.src.target >= 0 && g_targets[static_cast<std::size_t>(s.src.target)] &&
+                 static_cast<u64>(g_targets[static_cast<std::size_t>(s.src.target)]->w) * g_targets[static_cast<std::size_t>(s.src.target)]->h * 4 <= static_cast<u64>(ct.w) * ct.h)
+            group = read_snapshot(s.src.target, res);
         else group = s.src.group, res = s.src.res;
     }
     // DATE: the target's alpha as it is before this shape (a copy, brought up to date where alpha was written since the last one).
@@ -2411,13 +2468,14 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
         const bool with_open = !date_join && g_date_open_target == s.color;
         bool overlap = !by_tris || ct.date_tris.size() + (with_open ? g_date_open_tris.size() : 0) + static_cast<std::size_t>(ndtris) > kDateTris;
         for (int k = 0; k < ndtris && !overlap; ++k) {
-            for (const Tri &o : ct.date_tris)
-                if (!separated(dtris[k], o)) {
-                    overlap = true;
-                    break;
-                }
-            if (with_open)
-                for (const Tri &o : g_date_open_tris)
+            if (ct.date_tris.box_hits(dtris[k]))
+                for (const Tri &o : ct.date_tris.v)
+                    if (!separated(dtris[k], o)) {
+                        overlap = true;
+                        break;
+                    }
+            if (with_open && g_date_open_tris.box_hits(dtris[k]))
+                for (const Tri &o : g_date_open_tris.v)
                     if (!overlap && !separated(dtris[k], o)) overlap = true;
         }
         if (overlap) flush_date_tris(ct);
@@ -2428,7 +2486,7 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
         if (!date_join && g_date_open_target >= 0) {  // the open reversed draw is closed: its triangles are an earlier draw's now
             if (g_targets[static_cast<std::size_t>(g_date_open_target)]) {
                 Target &ot = *g_targets[static_cast<std::size_t>(g_date_open_target)];
-                if (ot.snap) ot.date_tris.insert(ot.date_tris.end(), g_date_open_tris.begin(), g_date_open_tris.end());
+                if (ot.snap) ot.date_tris.append(g_date_open_tris);
             }
             g_date_open_tris.clear();
             g_date_open_draw = ~std::size_t{0};
@@ -2896,7 +2954,13 @@ void order_group(const Graph &g, const std::vector<int> &ops, std::vector<int> &
         bool all = true;
         for (const int i : ops) {
             const Op &op = g_ops[static_cast<std::size_t>(i)];
-            if (done[static_cast<std::size_t>(i)] || op.kind != kOpPass || op.cs != cs) continue;
+            if (done[static_cast<std::size_t>(i)]) continue;
+            // a copy whose inputs are reachable is reachable too (it runs between this surface's passes): a small target that reads
+            // copies of itself (Harry Potter 2's shadow targets) counts as complete, and is drawn before a large target's node that
+            // happens to come first in the stream (each pass of that one costs far more). PS2_HWR_SCHED_COPIES=0: copies stop it.
+            static const bool through_copies = os::env("PS2_HWR_SCHED_COPIES") != "0";
+            const bool copy = op.kind != kOpPass && through_copies && !anchored(op);
+            if (!copy && (op.kind != kOpPass || op.cs != cs)) continue;
             bool ok = true;
             for (const int p : g.pred[static_cast<std::size_t>(i)])
                 if (in_group[static_cast<std::size_t>(p)] && !done[static_cast<std::size_t>(p)] && !reach[static_cast<std::size_t>(p)]) {
@@ -2904,7 +2968,7 @@ void order_group(const Graph &g, const std::vector<int> &ops, std::vector<int> &
                     break;
                 }
             reach[static_cast<std::size_t>(i)] = ok;
-            if (!ok) all = false;
+            if (!ok && !copy) all = false;
         }
         for (const int i : ops) reach[static_cast<std::size_t>(i)] = 0;
         return all;
@@ -3011,6 +3075,12 @@ void schedule() {
         }
         Graph g;
         build_graph(g);
+        if (g_dump_now)
+            for (std::size_t i = 0; i < n; ++i) {
+                std::string p;
+                for (const int q : g.pred[i]) p += " " + std::to_string(q) + (g_ops[static_cast<std::size_t>(q)].kind == kOpPass ? "p" : "c") + "t" + std::to_string(g_ops[static_cast<std::size_t>(q)].tgt);
+                std::fprintf(stderr, "[hwr-graph] op %zu kind %d t%d preds:%s\n", i, static_cast<int>(g_ops[i].kind), g_ops[i].tgt, p.c_str());
+            }
         // a load whose surface nothing draws into, reads or copies afterwards and that no target holds any more is not done: a target
         // made over current memory and cleared (renamed) right after (the menus: ~50 MB a frame at the screen's resolution)
         std::vector<u8> dead(n, 0);
