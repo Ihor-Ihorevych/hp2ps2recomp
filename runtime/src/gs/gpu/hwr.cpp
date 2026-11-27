@@ -4417,3 +4417,10 @@ void prof_name(int, const char *) {}
 void stats() {}
 }
 #endif
+
+#if defined(PS2_DRAW_SAMPLER)
+namespace ps2::gs::drawtime {
+// for system.cpp (PS2_EE_SAMPLE): the sampler on the calling thread, without windows.h there
+void sample_this_thread(const char *path) { start_sampler(path); }
+}
+#endif

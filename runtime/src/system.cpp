@@ -4,6 +4,10 @@
 #include "vu_micro.hpp"
 #include "gs/gs.hpp"
 #include "gs/queue.hpp"
+
+namespace ps2::gs::drawtime {
+void sample_this_thread(const char *path);  // gpu/hwr.cpp (the sampler of gs/drawtime.hpp, Windows; PS2_EE_SAMPLE)
+}
 #include "hw.hpp"
 #include "iop/iop.hpp"
 #include "iop/sif.hpp"
@@ -324,6 +328,18 @@ void path1_vblank_fence();
 void path1_vblank_hand_on();
 
 void vblank() {
+#if defined(_WIN32) && defined(__x86_64__)
+    {   // PS2_EE_SAMPLE=<file> (Windows, a measuring aid): the drawing-time sampler (gs/drawtime.hpp) on the emulation thread, 200 frames in
+        static std::uint64_t first = 0;
+        static bool started = false;
+        if (!first) first = g_frames + 1;
+        if (!started && g_frames >= first + 200) {
+            started = true;
+            const std::string path = os::env("PS2_EE_SAMPLE");
+            if (!path.empty()) ::ps2::gs::drawtime::sample_this_thread(path.c_str());
+        }
+    }
+#endif
     ++g_frames;
     crash::test_poll(crash::Thread::Game);
     // Offline EE cache preparation: capture only explicitly requested frames.
