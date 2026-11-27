@@ -1,4 +1,5 @@
 #include "gs.hpp"
+#include "drawtime.hpp"
 #include "ps2/prof.hpp"
 
 #include "gif.hpp"
@@ -779,6 +780,58 @@ void transfer(const State &s, std::uint64_t dir) {
 
 }
 
+#ifdef PS2_GPU
+// A run of primitives gathered from one PACKED run (write_packed_run, hw mode), handed to the renderer at once (gpu::draw_run) when a
+// register other than the vertex ones comes, when it is full and at the end of the run. Every corner is stored once (v) and the
+// primitives name theirs (idx): a strip's corner belongs to three triangles. While a run is open the queue of the last corners is kept as
+// the run's corner numbers (slot); s.queue is brought up to date when the run ends (run_end), so the rest of the GS sees the same queue.
+namespace {
+constexpr int kRunVerts = 1024, kRunPrims = 1024;
+struct Run {
+    Vertex v[kRunVerts];
+    std::uint16_t idx[3 * kRunPrims];
+    int nv = 0, n = 0, per = 0;
+    std::uint32_t slot[3] = {0, 1, 2};
+    bool open = false;
+};
+Run g_run;
+// The drawing thread plays GIF messages (render_pending): a run stays open from one message to the next (VU1 kicks a few triangles at a
+// time), until anything but vertex data comes (run_close in write(), write_packed(), write_image() and before every other message).
+bool g_run_keep = false;
+}
+// the queue's corners become the run's first ones
+static void run_begin() {
+    State &s = g_state;
+    Run &r = g_run;
+    r.open = true;
+    r.n = 0;
+    r.nv = s.count;
+    for (int k = 0; k < s.count; ++k) {
+        r.v[k] = s.queue[k];
+        r.slot[k] = static_cast<std::uint32_t>(k);
+    }
+}
+// what was gathered is drawn, and the queue is the GS's again
+static void run_end() {
+    State &s = g_state;
+    Run &r = g_run;
+    for (int k = 0; k < s.count; ++k) s.queue[k] = r.v[r.slot[k]];
+    r.open = false;
+    if (r.n) gpu::draw_run(s, r.v, r.nv, r.idx, r.n, r.per);
+    r.n = 0;
+}
+#endif
+[[gnu::always_inline]] static inline void run_close(int why = 3) {
+#ifdef PS2_GPU
+    if (g_run.open) [[unlikely]] {
+        if (drawtime::g_on) ++drawtime::g_close[why];
+        run_end();
+    }
+#else
+    (void)why;
+#endif
+}
+
 // Inlined into the PACKED run (write_packed_run): as a call of its own it cost the ship about 0.15 ms of the drawing thread a frame.
 [[gnu::always_inline]] static inline void kick(bool draw) {
     State &s = g_state;
@@ -838,6 +891,7 @@ void transfer(const State &s, std::uint64_t dir) {
 static const char *const g_gsseq = std::getenv("PS2_TRACE_GSSEQ");
 
 void write(std::uint32_t reg, std::uint64_t value) {
+    run_close(0);
     State &s = g_state;
     ++g_writes[reg & 127u];
     constexpr std::uint64_t kVertexRegs = (1ull << 0x01) | (1ull << 0x02) | (1ull << 0x03) | (1ull << 0x04) | (1ull << 0x05) | (1ull << 0x0A) | (1ull << 0x0C) | (1ull << 0x0D);
@@ -1027,6 +1081,7 @@ static void write_packed_generic(std::uint32_t reg, const Reg128 &q);
 }
 
 void write_packed(std::uint32_t reg, const Reg128 &q) {
+    run_close(1);
     if (g_gsseq) [[unlikely]] {
         write_packed_generic(reg, q);
         return;
@@ -1034,10 +1089,144 @@ void write_packed(std::uint32_t reg, const Reg128 &q) {
     packed_one(reg, q);
 }
 
+#ifdef PS2_GPU
+// write_packed_run in hw mode: the same register writes as packed_one for each qword, but the vertices go into the open run (g_run) and
+// its primitives are corner numbers. The vertex registers (RGBAQ, ST, UV, Q) and the queue (its length and run corner numbers) live in
+// locals for the loop and are written back before anything else can see them (another register, a full run, the end): kept in memory
+// they cost store-forwarding stalls (a 16-byte read of RGBAQ and ST right after two 8-byte writes, the queue shifted as one wide word).
+static void gather_run(const std::uint8_t *data, std::uint32_t count, std::uint64_t regs, std::uint32_t nreg, std::uint32_t reg) {
+    State &s = g_state;
+    Run &r = g_run;
+    if (!r.open) run_begin();
+    std::uint32_t prim = 0;
+    int needed = 0;
+    std::uint64_t rgbaq = 0, st = 0, uv = 0;
+    std::uint32_t qbits = 0;
+    int cnt = 0, nv = 0, n = 0;
+    std::uint32_t sl0 = 0, sl1 = 0, sl2 = 0;
+    const auto load = [&] {
+        prim = static_cast<std::uint32_t>(s.prim) & 7u;
+        needed = prim == 0 ? 1 : (prim == 1 || prim == 2 || prim == 6) ? 2 : prim == 7 ? 1 : 3;
+        if (r.n && r.per != needed) {  // (cannot happen: the kind of primitive changes only with PRIM, which ends the run)
+            run_end();
+            run_begin();
+        }
+        rgbaq = s.rgbaq, st = s.st, uv = s.uv;
+        std::memcpy(&qbits, &s.q, 4);
+        cnt = s.count, nv = r.nv, n = r.n;
+        sl0 = r.slot[0], sl1 = r.slot[1], sl2 = r.slot[2];
+    };
+    const auto store = [&] {
+        s.rgbaq = rgbaq, s.st = st, s.uv = uv;
+        std::memcpy(&s.q, &qbits, 4);
+        s.count = cnt, r.nv = nv, r.n = n;
+        r.slot[0] = sl0, r.slot[1] = sl1, r.slot[2] = sl2;
+        if (n) r.per = needed;
+    };
+    load();
+    // the data was written by the vector-unit thread on another core: ask for its lines at once instead of one miss after another
+    for (std::uint32_t off = 0; off < count * 16u && off < 2048u; off += 64u) __builtin_prefetch(data + off);
+    for (std::uint32_t k = 0; k < count; ++k) {
+        Reg128 q;
+        std::memcpy(&q, data + static_cast<std::size_t>(k) * 16, 16);
+        const std::uint32_t d = static_cast<std::uint32_t>(regs >> (reg * 4)) & 0xFu;
+        if (++reg >= nreg) reg = 0;
+        std::uint32_t x, y, z;
+        std::uint8_t f;
+        bool draw;
+        switch (d) {
+        case 0x1:
+            rgbaq = (q.w[0] & 0xFFu) | ((q.w[1] & 0xFFu) << 8) | ((q.w[2] & 0xFFu) << 16) | ((q.w[3] & 0xFFu) << 24) | (static_cast<std::uint64_t>(qbits) << 32);
+            continue;
+        case 0x2:
+            st = q.d[0];
+            qbits = q.w[2];
+            continue;
+        case 0x3: uv = (q.w[0] & 0x3FFFu) | ((q.w[1] & 0x3FFFu) << 16); continue;
+        case 0x4: {
+            const bool adc = (q.d[1] >> 47) & 1u;
+            ++g_writes[adc ? 0x0C : 0x04];
+            x = q.w[0] & 0xFFFFu, y = q.w[1] & 0xFFFFu, z = (q.w[2] >> 4) & 0xFFFFFFu, f = static_cast<std::uint8_t>((q.w[3] >> 4) & 0xFFu), draw = !adc;
+            break;
+        }
+        case 0x5: {
+            const bool adc = (q.d[1] >> 47) & 1u;
+            ++g_writes[adc ? 0x0D : 0x05];
+            x = q.w[0] & 0xFFFFu, y = q.w[1] & 0xFFFFu, z = q.w[2], f = static_cast<std::uint8_t>(s.fog >> 56), draw = !adc;
+            break;
+        }
+        default:  // the state may change: what was gathered is drawn with the state it had
+            store();
+            run_end();
+            write_packed_generic(d, q);
+            run_begin();
+            load();
+            continue;
+        }
+        // vertex(): into the run
+        if (cnt >= 3) cnt = 2;
+        if (nv == kRunVerts) {  // full: draw what was gathered, go on from the queue's corners
+            store();
+            run_end();
+            run_begin();
+            load();
+        }
+        Vertex &v = r.v[nv];
+        v.x = x, v.y = y, v.z = z, v.f = f;
+        v.r = static_cast<std::uint8_t>(rgbaq), v.g = static_cast<std::uint8_t>(rgbaq >> 8), v.b = static_cast<std::uint8_t>(rgbaq >> 16), v.a = static_cast<std::uint8_t>(rgbaq >> 24);
+        const std::uint32_t vq = static_cast<std::uint32_t>(rgbaq >> 32), vs = static_cast<std::uint32_t>(st), vt = static_cast<std::uint32_t>(st >> 32);
+        std::memcpy(&v.q, &vq, 4);
+        std::memcpy(&v.s, &vs, 4);
+        std::memcpy(&v.t, &vt, 4);
+        v.u = static_cast<std::uint32_t>(uv) & 0x3FFFu;
+        v.v = static_cast<std::uint32_t>(uv >> 16) & 0x3FFFu;
+        const std::uint32_t at = static_cast<std::uint32_t>(nv++);
+        if (cnt == 0) sl0 = at;
+        else if (cnt == 1) sl1 = at;
+        else sl2 = at;
+        ++cnt;
+        // kick()
+        if (cnt < needed) continue;
+        if (draw) {
+            if (n == kRunPrims) {
+                store();
+                run_end();
+                run_begin();
+                load();
+            }
+            std::uint16_t *out = r.idx + static_cast<std::size_t>(n) * static_cast<std::size_t>(needed);
+            out[0] = static_cast<std::uint16_t>(sl0);
+            if (needed > 1) out[1] = static_cast<std::uint16_t>(sl1);
+            if (needed > 2) out[2] = static_cast<std::uint16_t>(sl2);
+            ++n;
+            ++g_primitives;
+        }
+        switch (prim) {
+        case 2: sl0 = sl1, cnt = 1; break;
+        case 4: sl0 = sl1, sl1 = sl2, cnt = 2; break;
+        case 5: sl1 = sl2, cnt = 2; break;
+        default: cnt = 0; break;
+        }
+    }
+    store();
+}
+#endif
+
+
 // `count` qwords of PACKED data in a row, the first for descriptor `reg` of `regs` (`nreg` of them): the same writes in the same order as
 // write_packed for each one, but one call for the run instead of one per qword. On the God of War ship (about 53,000 small triangles a
 // frame, nine qwords each) the calls, the trace check and the reloads around them took about 0.3 ms of the drawing thread a frame.
 void write_packed_run(const std::uint8_t *data, std::uint32_t count, std::uint64_t regs, std::uint32_t nreg, std::uint32_t reg) {
+#ifdef PS2_GPU
+    // hw mode: the primitives of the run go to the renderer together (gpu::draw_run; PS2_HWR_BATCH=0 one by one as before)
+    if (!g_gsseq && !trace::g_any && gpu_on() && !cpu_raster() && gpu::batch_wanted()) {
+        const drawtime::Span packed_span(drawtime::kPacked);
+        gather_run(data, count, regs, nreg, reg);
+        if (!g_run_keep) run_end();
+        return;
+    }
+#endif
+    run_close(4);
     for (std::uint32_t k = 0; k < count; ++k) {
         Reg128 q;
         std::memcpy(&q, data + static_cast<std::size_t>(k) * 16, 16);
@@ -1092,7 +1281,10 @@ static void write_packed_generic(std::uint32_t reg, const Reg128 &q) {
     }
 }
 
-void write_image(const std::uint8_t *data, std::uint32_t qwords) { feed_image(data, static_cast<std::size_t>(qwords) * 16); }
+void write_image(const std::uint8_t *data, std::uint32_t qwords) {
+    run_close(2);
+    feed_image(data, static_cast<std::size_t>(qwords) * 16);
+}
 
 std::atomic<std::uint32_t> g_downloads{0};
 
@@ -1398,6 +1590,7 @@ std::vector<std::uint8_t> trip_fetch(const TripTicket &ticket) {
 
 bool trip_restore(const TripTicket &ticket, std::uint32_t qwc) {
 #ifdef PS2_GPU
+    run_close();  // image data in place of a GIF message's bytes: the open run of triangles is drawn first
     trip::Slot &s = trip::g_slots[ticket.slot % trip::kSlots];
     if (s.id != ticket.id || !s.saved || static_cast<std::size_t>(qwc) * 16 != s.bytes) return false;
     const std::uint64_t buf = g_state.bitbltbuf, pos = g_state.trxpos, reg = g_state.trxreg;
@@ -1835,7 +2028,11 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
     trip::serve_all();
     for (std::uint32_t n = 1; queue::render().peek(h, payload); ++n) {
         trip::serve_all();  // a thread that touched a depth download's memory waits for its bytes
-        if (!(n & 7u) && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budget_ms) return Rendered::busy;
+        if (h.type != queue::kGif) run_close();  // the open run of triangles is drawn before anything else happens (gs.cpp, write_packed_run)
+        if (!(n & 7u) && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budget_ms) {
+            run_close();
+            return Rendered::busy;
+        }
         bool presented = false;
         hitch::Clock::time_point step_start{};
         double step_cpu = 0;
@@ -1847,7 +2044,14 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
         switch (h.type) {
         case queue::kGif: {
             const prof::Scope gs_scope(prof::kRGs);  // PS2_PROF: the playback of the GS stream (the renderer's parts set their own labels inside)
+            const drawtime::Span gif_span(drawtime::kGif);
+#ifdef PS2_GPU
+            g_run_keep = true;
+#endif
             gif::render(static_cast<int>(h.arg0), payload, h.arg1);
+#ifdef PS2_GPU
+            g_run_keep = false;
+#endif
             break;
         }
         case queue::kGifReset: gif::render_reset(); break;
@@ -1935,11 +2139,13 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
         }
         queue::render().pop(h);
         if (presented) {
+            run_close();
             g_presented.fetch_add(1);
             queue::notify(g_presented);
             return Rendered::presented;
         }
     }
+    run_close();
     return Rendered::idle;
 }
 
