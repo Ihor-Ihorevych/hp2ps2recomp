@@ -1,4 +1,5 @@
 #include "gs.hpp"
+#include "drawtime.hpp"
 #include "ps2/prof.hpp"
 
 #include "gif.hpp"
@@ -779,12 +780,44 @@ void transfer(const State &s, std::uint64_t dir) {
 
 }
 
+#ifdef PS2_GPU
+// A run of primitives gathered from one PACKED run (write_packed_run, hw mode): their corners one after another, handed to the renderer
+// at once (gpu::draw_run) when a register other than the vertex ones comes, when it is full and at the end of the run.
+namespace {
+constexpr int kRunPrims = 256;
+struct Run {
+    Vertex v[3 * kRunPrims];
+    int n = 0, per = 0;
+};
+Run g_run;
+}
+static void flush_run() {
+    if (!g_run.n) return;
+    gpu::draw_run(g_state, g_run.v, g_run.n, g_run.per);
+    g_run.n = 0;
+}
+#endif
+
 // Inlined into the PACKED run (write_packed_run): as a call of its own it cost the ship about 0.15 ms of the drawing thread a frame.
+// kRun: the primitive goes into the run (g_run) instead of to the renderer at once (hw mode only; no CPU raster, no draw trace).
+template <bool kRun = false>
 [[gnu::always_inline]] static inline void kick(bool draw) {
     State &s = g_state;
     const std::uint32_t prim = static_cast<std::uint32_t>(s.prim) & 7u;
     const int needed = prim == 0 ? 1 : (prim == 1 || prim == 2 || prim == 6) ? 2 : prim == 7 ? 1 : 3;
     if (s.count < needed) return;
+#ifdef PS2_GPU
+    if constexpr (kRun) {
+        if (draw) {
+            Run &r = g_run;
+            if (r.n && r.per != needed) flush_run();
+            std::memcpy(r.v + static_cast<std::size_t>(r.n) * static_cast<std::size_t>(needed), s.queue, sizeof(Vertex) * static_cast<std::size_t>(needed));
+            r.per = needed;
+            if (++r.n == kRunPrims) flush_run();
+            ++g_primitives;
+        }
+    } else
+#endif
     if (draw) {
         if (!trace::g_any || trace::draw(s, needed)) {
             if (cpu_raster()) raster::draw(s, s.queue, needed);
@@ -814,6 +847,7 @@ void transfer(const State &s, std::uint64_t dir) {
     }
 }
 
+template <bool kRun = false>
 [[gnu::always_inline]] static inline void vertex(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint8_t f, bool draw) {
     State &s = g_state;
     if (s.count >= 3) s.count = 2;
@@ -832,7 +866,7 @@ void transfer(const State &s, std::uint64_t dir) {
     std::memcpy(&v.t, &tbits, 4);
     v.u = static_cast<std::uint32_t>(s.uv) & 0x3FFFu;
     v.v = static_cast<std::uint32_t>(s.uv >> 16) & 0x3FFFu;
-    kick(draw);
+    kick<kRun>(draw);
 }
 
 static const char *const g_gsseq = std::getenv("PS2_TRACE_GSSEQ");
@@ -995,6 +1029,7 @@ static void write_packed_generic(std::uint32_t reg, const Reg128 &q);
 // stores them; write() would unpack the vertex words into one 64-bit value just for vertex() to take them apart again. It counts the register
 // in g_writes (statistics) and does not change g_setup_generation for these registers, as write() does. The rest, and everything while
 // PS2_TRACE_GSSEQ prints the writes, goes the old way.
+template <bool kRun = false>
 [[gnu::always_inline]] static inline void packed_one(std::uint32_t reg, const Reg128 &q) {
     State &s = g_state;
     switch (reg) {
@@ -1013,16 +1048,21 @@ static void write_packed_generic(std::uint32_t reg, const Reg128 &q);
     case 0x4: {
         const bool adc = (q.d[1] >> 47) & 1u;
         ++g_writes[adc ? 0x0C : 0x04];
-        vertex(q.w[0] & 0xFFFFu, q.w[1] & 0xFFFFu, (q.w[2] >> 4) & 0xFFFFFFu, static_cast<std::uint8_t>((q.w[3] >> 4) & 0xFFu), !adc);
+        vertex<kRun>(q.w[0] & 0xFFFFu, q.w[1] & 0xFFFFu, (q.w[2] >> 4) & 0xFFFFFFu, static_cast<std::uint8_t>((q.w[3] >> 4) & 0xFFu), !adc);
         break;
     }
     case 0x5: {
         const bool adc = (q.d[1] >> 47) & 1u;
         ++g_writes[adc ? 0x0D : 0x05];
-        vertex(q.w[0] & 0xFFFFu, q.w[1] & 0xFFFFu, q.w[2], static_cast<std::uint8_t>(s.fog >> 56), !adc);
+        vertex<kRun>(q.w[0] & 0xFFFFu, q.w[1] & 0xFFFFu, q.w[2], static_cast<std::uint8_t>(s.fog >> 56), !adc);
         break;
     }
-    default: write_packed_generic(reg, q); break;
+    default:
+#ifdef PS2_GPU
+        if constexpr (kRun) flush_run();  // the state may change: what was gathered is drawn with the state it had
+#endif
+        write_packed_generic(reg, q);
+        break;
     }
 }
 
@@ -1038,6 +1078,19 @@ void write_packed(std::uint32_t reg, const Reg128 &q) {
 // write_packed for each one, but one call for the run instead of one per qword. On the God of War ship (about 53,000 small triangles a
 // frame, nine qwords each) the calls, the trace check and the reloads around them took about 0.3 ms of the drawing thread a frame.
 void write_packed_run(const std::uint8_t *data, std::uint32_t count, std::uint64_t regs, std::uint32_t nreg, std::uint32_t reg) {
+#ifdef PS2_GPU
+    // hw mode: the primitives of the run go to the renderer together (gpu::draw_run; PS2_HWR_BATCH=0 one by one as before)
+    if (!g_gsseq && !trace::g_any && gpu_on() && !cpu_raster() && gpu::batch_wanted()) {
+        for (std::uint32_t k = 0; k < count; ++k) {
+            Reg128 q;
+            std::memcpy(&q, data + static_cast<std::size_t>(k) * 16, 16);
+            packed_one<true>(static_cast<std::uint32_t>(regs >> (reg * 4)) & 0xFu, q);
+            if (++reg >= nreg) reg = 0;
+        }
+        flush_run();
+        return;
+    }
+#endif
     for (std::uint32_t k = 0; k < count; ++k) {
         Reg128 q;
         std::memcpy(&q, data + static_cast<std::size_t>(k) * 16, 16);
@@ -1847,6 +1900,7 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
         switch (h.type) {
         case queue::kGif: {
             const prof::Scope gs_scope(prof::kRGs);  // PS2_PROF: the playback of the GS stream (the renderer's parts set their own labels inside)
+            const drawtime::Span gif_span(drawtime::kGif);
             gif::render(static_cast<int>(h.arg0), payload, h.arg1);
             break;
         }

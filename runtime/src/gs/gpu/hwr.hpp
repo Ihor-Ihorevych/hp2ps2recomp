@@ -52,6 +52,13 @@ bool init(const Context &ctx);
 // gpu::draw in hw mode: one primitive (3 corners for triangles, 2 for sprites) with gpu.cpp's 40 setup words and 8 mipmap words.
 // `serial` changes whenever the setup words change (gpu.cpp's setup cache); `mip_top` is the highest mip level a pixel can read.
 void shape(const State &st, const std::uint32_t *setup, const std::uint32_t *mip, std::uint32_t mip_top, std::uint64_t serial, const Vertex *v, int count);
+// A run of `prims` primitives under one setup (the GS state of `st` and the setup words do not change between them), `per` corners each,
+// one after another in `v` (3 for triangles, 2 for sprites): the same as shape() for each of them in order, with the same results, but the
+// state checks, the render pass, the draw record and the page bookkeeping are done once per run where they cannot change (PS2_HWR_BATCH=0:
+// shape() per primitive). gs.cpp's PACKED runs call it through gpu::draw_run; a producer that makes whole lists of corners (a native
+// vector-unit stage) can call it the same way.
+void shapes(const State &st, const std::uint32_t *setup, const std::uint32_t *mip, std::uint32_t mip_top, std::uint64_t serial, const Vertex *v, int prims, int per);
+bool batch_on();  // PS2_HWR_BATCH (default on): runs of primitives go to shapes()
 // an upload chunk queued by gpu.cpp (rec: dbp, dbw, dpsm, dsax, dsay, rrw, done, pixels as queue_upload's record) and its bytes
 void upload(const std::uint32_t *rec, const std::uint8_t *bytes, std::size_t size);
 // a palette load (after gpu.cpp queued it): what load_clut in gs.wgsl reads

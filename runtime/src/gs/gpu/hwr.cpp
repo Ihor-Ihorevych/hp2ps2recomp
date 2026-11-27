@@ -9,6 +9,7 @@
 // schedule), PS2_HWR_TIME=1 (card time per render pass), PS2_HWR_NOPASS=1|draws (measuring aid), PS2_HWR_PIPELINES=<file> (pipeline list).
 #include "hwr.hpp"
 #include "../../prov.hpp"
+#include "../drawtime.hpp"
 
 #ifndef __EMSCRIPTEN__
 
@@ -2002,24 +2003,27 @@ bool init(const Context &ctx) {
         std::fprintf(stderr, "[hwr] %zu pipelines made at the start (%zu keys, list %s) in %.1f ms\n", g_pipes.size(), keys.size(), path.empty() ? "-" : path.c_str(),
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
+    drawtime::g_on = os::env("PS2_DRAW_TIME") == "1";
     g_on = true;
     std::fprintf(stderr, "[hwr] hardware renderer on (PS2_RENDERER=hw): dual-source blending %s, texture cache %llu MB\n", C.dual ? "yes" : "no",
                  static_cast<unsigned long long>(g_cache_budget >> 20));
     return true;
 }
 
-void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 serial, const Vertex *v, int count) {
-    const auto t0 = g_log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};  // timed for PS2_HWR_LOG only: two clock reads per shape cost ~1 ms per frame on a phone
-    const prof::Scope shape_scope(prof::kRShape);
-    ++F.shapes;
-    if (prov::g_on) prov::count(prov::kShapes);
-    const u32 prim = static_cast<u32>(st.prim) & 7u;
-    DrawState &s = g_ds;
+namespace {
+long skip_tbp_value() {
+    static const long v = os::env("PS2_HWR_SKIP_TBP").empty() ? -1 : std::strtol(os::env("PS2_HWR_SKIP_TBP").c_str(), nullptr, 16);
+    return v;
+}
+
+// the draw state of the shapes that follow, worked out again when the setup, the epoch (uploads, palette loads, page owners) or the submit changed
+inline void prepare_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 serial, u32 prim) {
     if (s.serial != serial || s.epoch != g_epoch || s.submit != g_submit) {
         ++F.builds;
         if (s.serial == serial && s.submit == g_submit) ++F.builds_epoch;
         const auto b0 = g_log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const prof::Scope build_scope(prof::kRBuild);
+        const drawtime::Span build_span(drawtime::kBuild);
         build_state(s, st, w, mip, mip_top, prim);
         if (g_log) F.build_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0).count();
         s.serial = serial;
@@ -2029,6 +2033,31 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
         s.sc[0] = static_cast<int>(w[10] & 0xFFFFu), s.sc[2] = static_cast<int>(w[10] >> 16);
         s.sc[1] = static_cast<int>(w[11] & 0xFFFFu), s.sc[3] = static_cast<int>(w[11] >> 16);
     }
+}
+
+// one corner of a shape as the card's vertex (GS pixel x is the centre of the card's pixel x)
+[[gnu::always_inline]] inline void put_vtx(Vtx &o, float x, float y, const Vertex &col, const Vertex &tv, u32 z, u8 fog, float tq, float sxs, float sys, u32 zmax,
+                                           double zscale, bool fst, u32 param) {
+    o.x = (x + 0.5f) * sxs - 1.0f;  // at PS2_SCALE the card's samples sit at the centres of the GS pixel's parts (x + 1/(2 scale) ...)
+    o.y = 1.0f - (y + 0.5f) * sys;
+    o.z = static_cast<float>(static_cast<double>(std::min(z, zmax)) / zscale);
+    o.rgba = col.r | (static_cast<u32>(col.g) << 8) | (static_cast<u32>(col.b) << 16) | (static_cast<u32>(col.a) << 24);
+    if (fst) o.s = static_cast<float>(tv.u) / 16.0f, o.t = static_cast<float>(tv.v) / 16.0f, o.q = 1.0f;
+    else o.s = tv.s, o.t = tv.t, o.q = tq;
+    o.fog = static_cast<float>(fog);
+    o.di = param;
+}
+}  // namespace
+
+void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 serial, const Vertex *v, int count) {
+    const auto t0 = g_log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};  // timed for PS2_HWR_LOG only: two clock reads per shape cost ~1 ms per frame on a phone
+    const prof::Scope shape_scope(prof::kRShape);
+    const drawtime::Span shape_span(drawtime::kShape);
+    ++F.shapes;
+    if (prov::g_on) prov::count(prov::kShapes);
+    const u32 prim = static_cast<u32>(st.prim) & 7u;
+    DrawState &s = g_ds;
+    prepare_state(s, st, w, mip, mip_top, serial, prim);
     // A view-4 draw reads every texel from one target (the owner of the texture's first page). The texels this draw reads must all lie in
     // pages that target holds; otherwise (Harry Potter 2's sun haze: a 1408-wide T8 view over a 704-wide 16-bit buffer, whose further
     // pages belong to the frame, a blur target and memory) this one draw is set up again the old way (write-back and decode).
@@ -2113,7 +2142,7 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
         return;
     }
     // PS2_HWR_SKIP_TBP=<hex>: shapes reading that texture base are not drawn (a bisecting aid)
-    static const long skip_tbp = os::env("PS2_HWR_SKIP_TBP").empty() ? -1 : std::strtol(os::env("PS2_HWR_SKIP_TBP").c_str(), nullptr, 16);
+    const long skip_tbp = skip_tbp_value();
     if (skip_tbp >= 0 && (w[0] & 2u) && static_cast<long>(w[12]) == skip_tbp) return;
     if (s.skip == 1) {
         ++F.skipped;
@@ -2239,15 +2268,7 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
     const u32 zmax = s.zmax, param = s.param;
     const double zscale = s.zscale;
     const auto put = [&](float x, float y, const Vertex &col, const Vertex &tv, u32 z, u8 fog, float tq) {
-        Vtx &o = *out++;
-        o.x = (x + 0.5f) * sxs - 1.0f;  // at PS2_SCALE the card's samples sit at the centres of the GS pixel's parts (x + 1/(2 scale) ...)
-        o.y = 1.0f - (y + 0.5f) * sys;
-        o.z = static_cast<float>(static_cast<double>(std::min(z, zmax)) / zscale);
-        o.rgba = col.r | (static_cast<u32>(col.g) << 8) | (static_cast<u32>(col.b) << 16) | (static_cast<u32>(col.a) << 24);
-        if (fst) o.s = static_cast<float>(tv.u) / 16.0f, o.t = static_cast<float>(tv.v) / 16.0f, o.q = 1.0f;
-        else o.s = tv.s, o.t = tv.t, o.q = tq;
-        o.fog = static_cast<float>(fog);
-        o.di = param;
+        put_vtx(*out++, x, y, col, tv, z, fog, tq, sxs, sys, zmax, zscale, fst, param);
     };
     if (prim == 6) {
         const Vertex &a = v[0], &b = v[1];
@@ -2383,6 +2404,199 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
         }
     }
     if (g_log) F.cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+bool batch_on() {
+    static const bool on = os::env("PS2_HWR_BATCH") != "0";
+    return on;
+}
+
+namespace {
+// Triangles of one run (shapes()) while the draw state stays what it is: what shape() does for each, in the same order and with the same
+// results, without what cannot change between them. Ends after the triangle that changed the epoch (a page taken from another owner, a
+// target grown): the next one's state is worked out again, as shape() would. Returns how many triangles it took.
+int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u32 mip_top, const Vertex *v, int prims, u32 prim) {
+    (void)prim;
+    const u64 epoch = g_epoch;
+    u64 attr = st.prim;
+    if (!(st.prmodecont & 1u)) attr = (st.prim & 7u) | (st.prmode & ~7ull);
+    const ps2::gs::Context &gc = st.ctx[(attr >> 9) & 1u];
+    const float ofx = static_cast<float>(gc.xyoffset & 0xFFFFu), ofy = static_cast<float>((gc.xyoffset >> 32) & 0xFFFFu);
+    Target &ct = *g_targets[static_cast<std::size_t>(s.color)];
+    const int W = static_cast<int>(ct.w);
+    int H = static_cast<int>(ct.h);
+    const u32 flags = w[0];
+    Target *dt = s.needs_depth ? g_targets[static_cast<std::size_t>(s.depth)].get() : nullptr;
+    const WGPUBindGroup group = s.src.kind ? s.src.group : g_dummy_group;
+    const u64 res = s.src.kind ? s.src.res : 0;
+    const bool fst = flags & 16u, iip = flags & 1u;
+    float sxs = 2.0f / static_cast<float>(W), sys = 2.0f / static_cast<float>(H);
+    const u32 zmax = s.zmax, param = s.param;
+    const double zscale = s.zscale;
+    // the pages already taken in this run (page columns and rows, inclusive): a triangle inside them changes no owner (and counts as a write
+    // to them already: g_page_write is only compared with what the last write-back saw)
+    u32 cpw, cph, dpw = 1, dph = 1;
+    page_dims(ct.psm, cpw, cph);
+    if (dt) page_dims(dt->psm, dpw, dph);
+    int cpr[4] = {1, 1, 0, 0}, dpr[4] = {1, 1, 0, 0};  // empty
+    DrawRec *cur = nullptr;  // the draw this run's triangles go into, once known
+    const u32 first_all = static_cast<u32>(g_verts.size());
+    g_verts.resize(first_all + static_cast<std::size_t>(prims) * 3u);  // written in place; cut to what was drawn at the end
+    u32 used = first_all;
+    int k = 0;
+    while (k < prims) {
+        const Vertex *t = v + static_cast<std::size_t>(k) * 3u;
+        ++k;
+        ++F.shapes;
+        float px[3], py[3];
+        float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f;
+        for (int i = 0; i < 3; ++i) {
+            px[i] = (static_cast<float>(t[i].x) - ofx) / 16.0f;
+            py[i] = (static_cast<float>(t[i].y) - ofy) / 16.0f;
+            minx = std::min(minx, px[i]), maxx = std::max(maxx, px[i]);
+            miny = std::min(miny, py[i]), maxy = std::max(maxy, py[i]);
+        }
+        int x0 = std::max(s.sc[0], static_cast<int>(std::ceil(minx))), x1 = std::min(s.sc[2], static_cast<int>(std::ceil(maxx)));
+        int y0 = std::max(s.sc[1], static_cast<int>(std::ceil(miny))), y1 = std::min(s.sc[3], static_cast<int>(std::ceil(maxy)));
+        x0 = std::max(x0, 0), y0 = std::max(y0, 0);
+        if (x1 < x0 || y1 < y0) {
+            ++F.skipped;
+            continue;
+        }
+        if (y1 >= H && H < static_cast<int>(kMaxRows)) {
+            const u32 rows = std::min<u32>(kMaxRows, std::max<u32>(512u, (static_cast<u32>(y1) + 32u) & ~31u));
+            grow(s.color, rows);
+            if (s.needs_depth) grow(s.depth, rows);
+            H = static_cast<int>(ct.h);
+            sys = 2.0f / static_cast<float>(H);
+            cur = nullptr;  // another surface: the pass and the scissor are found again
+        }
+        if (x1 >= W || y1 >= H) {
+            ++F.approx[kOutside];
+            x1 = std::min(x1, W - 1), y1 = std::min(y1, H - 1);
+            if (x1 < x0 || y1 < y0) {
+                if (g_epoch != epoch) break;
+                continue;
+            }
+        }
+        g_clear.on = false;  // a triangle ends a run of clear strips (shape(): not the same kind)
+        if (g_log && s.src.kind == 1 && mip_top && mip[0]) {
+            const u32 m = mip[0];
+            const float kk = static_cast<float>(static_cast<int32_t>(((m >> 16) & 0xFFFu) << 20) >> 20) / 16.0f;
+            float lod_max = kk;
+            if (!(m & 1u) && !(w[0] & 16u)) {
+                float qmin = 1e30f;
+                for (int i = 0; i < 3; ++i) qmin = std::min(qmin, std::fabs(t[i].q));
+                lod_max = qmin > 0.0f ? std::log2(1.0f / qmin) * static_cast<float>(1u << ((m >> 8) & 3u)) + kk : 1e9f;
+            }
+            const u32 need = lod_max <= -0.01f ? 1u : std::min<u32>(mip_top + 1u, static_cast<u32>(std::floor(lod_max)) + 2u);
+            ++F.mipneed[std::min<u32>(need, 7u)];
+            ++F.mipdraws;
+        }
+        const u32 first = used;
+        Vtx *out = g_verts.data() + first;
+        for (int i = 0; i < 3; ++i) put_vtx(out[i], px[i], py[i], iip ? t[i] : t[2], t[i], t[i].z, t[i].f, t[i].q, sxs, sys, zmax, zscale, fst, param);
+        used += 3;
+        if (cur) {
+            cur->count += 3;
+        } else {
+            ensure_pass(s);
+            Op &pass = g_ops[static_cast<std::size_t>(g_open_pass)];
+            u32 sc[4] = {static_cast<u32>(std::max(s.sc[0], 0)), static_cast<u32>(std::max(s.sc[1], 0)), 0, 0};
+            const u32 ex = static_cast<u32>(std::max(std::min(s.sc[2] + 1, W), 0)), ey = static_cast<u32>(std::max(std::min(s.sc[3] + 1, H), 0));
+            sc[2] = ex > sc[0] ? ex - sc[0] : 0;
+            sc[3] = ey > sc[1] ? ey - sc[1] : 0;
+            bool merged = false;
+            if (pass.draw_count) {
+                DrawRec &last = g_draws.back();
+                if (last.k1 == s.kp1 && last.k2 == s.kp2 && last.group == group && last.blend == s.blend && last.zuse == s.needs_depth && std::equal(sc, sc + 4, last.sc) &&
+                    last.first + last.count == first) {
+                    last.count += 3;
+                    merged = true;
+                }
+            }
+            if (!merged) {
+                g_split_tris.clear();
+                DrawRec r;
+                r.k1 = s.kp1, r.k2 = s.kp2, r.group = group, r.blend = s.blend;
+                std::copy(sc, sc + 4, r.sc);
+                r.first = first, r.count = 3;
+                r.res = res;
+                r.zuse = s.needs_depth;
+                r.zread = s.zread;
+                g_draws.push_back(r);
+                ++pass.draw_count;
+            }
+            cur = &g_draws.back();
+        }
+        if (s.cwrite_any) {
+            ct.valid_w = std::max(ct.valid_w, x1 + 1), ct.valid_h = std::max(ct.valid_h, y1 + 1);
+            const int a = x0 / static_cast<int>(cpw), b = y0 / static_cast<int>(cph), c = x1 / static_cast<int>(cpw), d = y1 / static_cast<int>(cph);
+            if (a < cpr[0] || b < cpr[1] || c > cpr[2] || d > cpr[3]) {
+                for_pages(ct.psm, ct.bp, ct.bw, x0, y0, x1, y1, [&](u32 page) {
+                    take_page(s.color, page);
+                    ++g_page_write[page & (kPages - 1)];
+                });
+                cpr[0] = a, cpr[1] = b, cpr[2] = c, cpr[3] = d;
+            }
+            note_write(ct, x0, y0, x1, y1, s.awrite_any);
+        }
+        if (s.zwrite_any && dt) {
+            dt->valid_w = std::max(dt->valid_w, x1 + 1), dt->valid_h = std::max(dt->valid_h, y1 + 1);
+            const int a = x0 / static_cast<int>(dpw), b = y0 / static_cast<int>(dph), c = x1 / static_cast<int>(dpw), d = y1 / static_cast<int>(dph);
+            if (a < dpr[0] || b < dpr[1] || c > dpr[2] || d > dpr[3]) {
+                for_pages(dt->psm, dt->bp, dt->bw, x0, y0, x1, y1, [&](u32 page) {
+                    take_page(s.depth, page);
+                    ++g_page_write[page & (kPages - 1)];
+                });
+                dpr[0] = a, dpr[1] = b, dpr[2] = c, dpr[3] = d;
+            }
+        }
+        ++F.drawn;
+        F.vertices += 3;
+        if (g_epoch != epoch) break;  // the next triangle's state is worked out again (shape(): prepare_state)
+    }
+    g_verts.resize(used);
+    return k;
+}
+}  // namespace
+
+void shapes(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 serial, const Vertex *v, int prims, int per) {
+    const u32 prim = static_cast<u32>(st.prim) & 7u;
+    if (!batch_on() || per != 3 || prim < 3 || prim > 5 || g_dump_now || prov::g_on || page_log() >= 0 || skip_tbp_value() >= 0) {
+        for (int i = 0; i < prims; ++i) shape(st, w, mip, mip_top, serial, v + static_cast<std::size_t>(i) * static_cast<std::size_t>(per), per);
+        return;
+    }
+    DrawState &s = g_ds;
+    int i = 0;
+    while (i < prims) {
+        {
+            const auto t0 = g_log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const prof::Scope shape_scope(prof::kRShape);
+            const drawtime::Span shape_span(drawtime::kShape);
+            prepare_state(s, st, w, mip, mip_top, serial, prim);
+            const int rest = prims - i;
+            if (s.skip == 2) {  // not drawn (the reason counted), nor anything after it in the run: nothing it does changes the state
+                F.shapes += static_cast<u64>(rest);
+                F.fallback[s.reason] += static_cast<u64>(rest);
+                return;
+            }
+            if (s.skip == 1) {
+                F.shapes += static_cast<u64>(rest);
+                F.skipped += static_cast<u64>(rest);
+                return;
+            }
+            const bool fast = s.src.view != 4 && !(s.src.kind && s.src.target >= 0 && s.src.target == s.color) && s.kp2 == 0;
+            if (fast) {
+                i += triangle_run(s, st, w, mip, mip_top, v + static_cast<std::size_t>(i) * 3u, rest, prim);
+                if (g_log) F.cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                continue;
+            }
+        }
+        // a draw that reads its own target, reads through memory addresses (view 4) or is drawn twice (alpha test): shape() by shape
+        shape(st, w, mip, mip_top, serial, v + static_cast<std::size_t>(i) * 3u, 3);
+        ++i;
+    }
 }
 
 void upload(const u32 *rec, const u8 *bytes, std::size_t size) {
@@ -3408,6 +3622,27 @@ void submitted() {
 void frame_end() {
     if (!g_on) return;
     ++g_frames;
+    if (drawtime::g_on) {  // PS2_DRAW_TIME=1: the drawing thread's GS stream time per picture, every 100 pictures (drawtime.hpp)
+        static u64 frames = 0, tsc0 = drawtime::now();
+        static auto clock0 = std::chrono::steady_clock::now();
+        if (++frames % 100 == 0) {
+            const u64 tsc1 = drawtime::now();
+            const auto clock1 = std::chrono::steady_clock::now();
+            const double ms_per_tick = std::chrono::duration<double, std::milli>(clock1 - clock0).count() / static_cast<double>(tsc1 - tsc0);
+            const auto ms = [&](int part) { return static_cast<double>(drawtime::g_sum[part]) * ms_per_tick / 100.0; };
+            static double thread0 = -1.0;
+            const double thread1 = drawtime::thread_ms(ms_per_tick);
+            if (thread0 >= 0.0) std::fprintf(stderr, "[draw-time] drawing thread processor time %.3f ms per picture\n", (thread1 - thread0) / 100.0);
+            thread0 = thread1;
+            std::fprintf(stderr, "[draw-time] frames %llu-%llu, per picture: gif %.3f ms (%llu messages), shape %.3f ms (%llu calls), build %.3f ms (%llu)\n",
+                         static_cast<unsigned long long>(g_frames - 98), static_cast<unsigned long long>(g_frames + 1), ms(drawtime::kGif),
+                         static_cast<unsigned long long>(drawtime::g_count[drawtime::kGif] / 100), ms(drawtime::kShape),
+                         static_cast<unsigned long long>(drawtime::g_count[drawtime::kShape] / 100), ms(drawtime::kBuild),
+                         static_cast<unsigned long long>(drawtime::g_count[drawtime::kBuild] / 100));
+            for (int k = 0; k < drawtime::kParts; ++k) drawtime::g_sum[k] = drawtime::g_count[k] = 0;
+            tsc0 = tsc1, clock0 = clock1;
+        }
+    }
     timer_read();
     static const long dump_frame = os::env("PS2_HWR_DUMP").empty() ? -1 : std::strtol(os::env("PS2_HWR_DUMP").c_str(), nullptr, 10);
     g_dump_now = dump_frame >= 0 && static_cast<long>(g_frames) == dump_frame;
@@ -3484,6 +3719,8 @@ int g_sweep = 0;
 bool requested() { return false; }
 bool init(const Context &) { return false; }
 void shape(const State &, const std::uint32_t *, const std::uint32_t *, std::uint32_t, std::uint64_t, const Vertex *, int) {}
+void shapes(const State &, const std::uint32_t *, const std::uint32_t *, std::uint32_t, std::uint64_t, const Vertex *, int, int) {}
+bool batch_on() { return false; }
 void upload(const std::uint32_t *, const std::uint8_t *, std::size_t) {}
 void clut(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, bool, std::uint32_t, std::uint32_t, std::uint32_t) {}
 void pre_blocks(bool, const std::uint32_t *, std::vector<std::uint32_t> &) {}

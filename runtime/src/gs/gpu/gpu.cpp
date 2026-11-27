@@ -5620,12 +5620,7 @@ static bool compile_pipelines() {
     return true;
 }
 
-void draw(const State &st, const Vertex *v, int count) {
-    if (g_image.active && !g_image.pending.empty()) flush_image();
-    std::uint64_t attr = st.prim;
-    if (!(st.prmodecont & 1u)) attr = (st.prim & 7u) | (st.prmode & ~7ull);
-    const std::uint32_t prim = static_cast<std::uint32_t>(st.prim) & 7u;
-    const Context &c = st.ctx[(attr >> 9) & 1u];
+static SetupCache &setup_of(const State &st, std::uint64_t attr) {
     SetupCache &cache = g_setup_cache;
     if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != g_clut_slot
         || (cache.waits && hw::live_ready_changed(cache.ready_seen))
@@ -5652,6 +5647,28 @@ void draw(const State &st, const Vertex *v, int count) {
             }
         }
     }
+    return cache;
+}
+
+// A run of primitives under one GS state (gs.cpp's PACKED runs, gs::flush_run): the setup once, then the hardware renderer takes them all
+// (hwr::shapes). Only used in hw mode (gs.cpp asks batch_wanted()).
+void draw_run(const State &st, const Vertex *v, int prims, int per) {
+    if (g_image.active && !g_image.pending.empty()) flush_image();
+    std::uint64_t attr = st.prim;
+    if (!(st.prmodecont & 1u)) attr = (st.prim & 7u) | (st.prmode & ~7ull);
+    const SetupCache &cache = setup_of(st, attr);
+    hwr::shapes(st, cache.setup, cache.mip, cache.mip_top, cache.serial, v, prims, per);
+}
+
+bool batch_wanted() { return hwr::g_on && hwr::batch_on(); }
+
+void draw(const State &st, const Vertex *v, int count) {
+    if (g_image.active && !g_image.pending.empty()) flush_image();
+    std::uint64_t attr = st.prim;
+    if (!(st.prmodecont & 1u)) attr = (st.prim & 7u) | (st.prmode & ~7ull);
+    const std::uint32_t prim = static_cast<std::uint32_t>(st.prim) & 7u;
+    const Context &c = st.ctx[(attr >> 9) & 1u];
+    SetupCache &cache = setup_of(st, attr);
     if (hwr::g_on) {  // PS2_RENDERER=hw: the hardware renderer draws the shape (hwr.cpp)
         hwr::shape(st, cache.setup, cache.mip, cache.mip_top, cache.serial, v, count);
         return;
