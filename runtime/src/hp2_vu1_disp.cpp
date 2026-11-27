@@ -36,14 +36,14 @@ bool image_ok(std::uint32_t pc) {
 
 // From `pc` on until the batch ends (-1) or reaches a program the native set does not cover (its address: the chain loop runs it).
 // `transform`: the code at 0x16D8 is the code the native transform stage was made for (key checked by the caller).
-std::int64_t run_batch(Vu0Regs &r, std::uint8_t *mem, std::uint32_t pc, bool guard, bool transform) {
+std::int64_t run_batch(Vu0Regs &r, std::uint8_t *mem, std::uint32_t pc, bool guard, bool transform, bool image) {
     if ((r.status & 0xC0u) != 0xC0u) return pc;  // the fused bodies are the kSticky = false copies (sticky zero/sign bits already set)
     for (int steps = 0; steps < 4096; ++steps) {
         if (pc == 0x16D8u && transform) {
             const std::uint32_t next = stage_16d8(r, mem, guard);
             if (!next) return pc;
             pc = next;
-        } else if (image_ok(pc)) {
+        } else if (image && image_ok(pc)) {
             pc = image_fused(r, mem, pc);
             if (pc == kEnded) return -1;
         } else {

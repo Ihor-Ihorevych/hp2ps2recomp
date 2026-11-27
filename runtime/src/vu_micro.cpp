@@ -33,7 +33,7 @@ namespace ps2::hp2 {
 std::uint32_t stage_16d8(Vu0Regs &r, std::uint8_t *mem, bool guard);  // hp2_vu1.cpp: Harry Potter 2's native VU1 stages
 std::uint32_t stage_1c28(Vu0Regs &r, std::uint8_t *mem);              // hp2_vu1_skin.cpp: its skinning stage, fused
 bool image_ok(std::uint32_t pc);                                      // hp2_vu1_disp.cpp: its microcode fused, with the native transform
-std::int64_t run_batch(Vu0Regs &r, std::uint8_t *mem, std::uint32_t pc, bool guard, bool transform);
+std::int64_t run_batch(Vu0Regs &r, std::uint8_t *mem, std::uint32_t pc, bool guard, bool transform, bool image);
 }
 
 namespace ps2::vu {
@@ -1717,10 +1717,11 @@ void interpret_full(int unit, std::uint32_t pc) {
 #endif
                 }();
                 const bool transform = native_transform && t16.generation == g_generation[1] && t16.key == kHp2Stage16D8;
-                if (hp2 && hp2 != 3 && (hp2::image_ok(pc & 16383u) || ((pc & 16383u) == 0x16D8u && transform))) {
+                static const bool image = os::env("PS2_HP2_IMAGE") != "0";  // the fused microcode (0: only the native transform)
+                if (hp2 && hp2 != 3 && ((image && hp2::image_ok(pc & 16383u)) || ((pc & 16383u) == 0x16D8u && transform))) {
                     // from here natively (hp2_vu1_disp.cpp): the fused microcode, the native transform; until the batch ends or reaches a
                     // program the native set does not hold
-                    const std::int64_t next = hp2::run_batch(g_vu1, g_vu1_mem, pc & 16383u, hp2 == 1, transform);
+                    const std::int64_t next = hp2::run_batch(g_vu1, g_vu1_mem, pc & 16383u, hp2 == 1, transform, image);
                     if (next == static_cast<std::int64_t>(pc & 16383u)) e.function(g_vu1, g_vu1_mem);  // declined at once: the compiled program
                     else if (next >= 0) g_chained = next;
                 } else if (hp2 && (pc & 16383u) == 0x16D8u && e.key == kHp2Stage16D8) {
