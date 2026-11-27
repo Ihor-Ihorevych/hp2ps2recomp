@@ -32,8 +32,8 @@
 namespace ps2::hp2 {
 std::uint32_t stage_16d8(Vu0Regs &r, std::uint8_t *mem, bool guard);  // hp2_vu1.cpp: Harry Potter 2's native VU1 stages
 std::uint32_t stage_1c28(Vu0Regs &r, std::uint8_t *mem);              // hp2_vu1_skin.cpp: its skinning stage, fused
-bool is_dispatcher_entry(std::uint32_t pc);                           // hp2_vu1_disp.cpp: its dispatcher, fused, with the native stages
-std::int64_t run_batch(Vu0Regs &r, std::uint8_t *mem, std::uint32_t pc, bool guard, bool transform, bool skin);
+bool image_ok(std::uint32_t pc);                                      // hp2_vu1_disp.cpp: its microcode fused, with the native transform
+std::int64_t run_batch(Vu0Regs &r, std::uint8_t *mem, std::uint32_t pc, bool guard, bool transform);
 }
 
 namespace ps2::vu {
@@ -1458,6 +1458,12 @@ void hp2_check(ProgramFn compiled) {
                      static_cast<unsigned long long>(declined), static_cast<unsigned long long>(clipped));
 }
 
+// the program at `pc` is the one with `key` in this code generation (the fused functions check it before they go there)
+bool hp2_key_ok(std::uint32_t pc, std::uint64_t key) {
+    const EntryCache &c = g_entries[(pc & 16383u) >> 3];
+    return c.generation == g_generation[1] && c.key == key;
+}
+
 bool hp2_disp_known() {
     for (int i = 0; i < 6; ++i) {
         const EntryCache &c = g_entries[kHp2DispAt[i] >> 3];
@@ -1697,12 +1703,26 @@ void interpret_full(int unit, std::uint32_t pc) {
                 const prof::Scope prog_scope(prof::kVProg);
                 // Harry Potter 2's transform stage done natively (hp2_vu1.cpp); the compiled program when the stage declines the batch
                 const int hp2 = hp2_native_mode();
-                if (hp2 && hp2 != 3 && hp2::is_dispatcher_entry(pc & 16383u) && hp2_disp_known()) {
-                    // the whole batch from here (hp2_vu1_disp.cpp): the dispatcher fused, the native stages called directly
-                    const EntryCache &t = g_entries[0x16D8u >> 3];
-                    const bool transform = t.generation == g_generation[1] && t.key == kHp2Stage16D8;
-                    const std::int64_t next = hp2::run_batch(g_vu1, g_vu1_mem, pc & 16383u, hp2 == 1, transform, hp2_skin_known());
-                    if (next >= 0) g_chained = next;
+                const EntryCache &t16 = g_entries[0x16D8u >> 3];
+                // the native transform: on by default on arm64, where it is ~1.5x cheaper than the compiled stage per vertex; on x86 it has to
+                // clamp every result as the compiled programs do there (no SSE4.1 in the live libraries) and is slower: the fused image runs
+                // the compiled stage and its clipper instead. PS2_HP2_TRANSFORM=1 / 0 chooses.
+                static const bool native_transform = [] {
+                    const std::string v = os::env("PS2_HP2_TRANSFORM");
+                    if (!v.empty()) return v != "0";
+#if defined(__aarch64__)
+                    return true;
+#else
+                    return false;
+#endif
+                }();
+                const bool transform = native_transform && t16.generation == g_generation[1] && t16.key == kHp2Stage16D8;
+                if (hp2 && hp2 != 3 && (hp2::image_ok(pc & 16383u) || ((pc & 16383u) == 0x16D8u && transform))) {
+                    // from here natively (hp2_vu1_disp.cpp): the fused microcode, the native transform; until the batch ends or reaches a
+                    // program the native set does not hold
+                    const std::int64_t next = hp2::run_batch(g_vu1, g_vu1_mem, pc & 16383u, hp2 == 1, transform);
+                    if (next == static_cast<std::int64_t>(pc & 16383u)) e.function(g_vu1, g_vu1_mem);  // declined at once: the compiled program
+                    else if (next >= 0) g_chained = next;
                 } else if (hp2 && (pc & 16383u) == 0x16D8u && e.key == kHp2Stage16D8) {
                     if (hp2 == 3) {
                         hp2_check(e.function);
@@ -2583,4 +2603,9 @@ void hp2_send_packet(const std::uint8_t *data, std::uint32_t qwords) {
     kick_flush();
     gif::transfer(1, data, qwords);
 }
+}
+
+namespace ps2::hp2 {
+// for the fused programs (hp2_*_fused.inc): the code at `pc` is the code the block was made from
+bool key_ok(std::uint32_t pc, std::uint64_t key) { return ps2::vu::hp2_key_ok(pc, key); }
 }

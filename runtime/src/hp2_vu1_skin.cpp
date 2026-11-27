@@ -18,6 +18,8 @@
 
 namespace ps2::hp2 {
 
+bool key_ok(std::uint32_t pc, std::uint64_t key);  // vu_micro.cpp
+
 namespace {
 using namespace ps2;
 using namespace ps2::vuops;
