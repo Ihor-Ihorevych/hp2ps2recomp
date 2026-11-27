@@ -276,3 +276,56 @@ frame (`g_ring_submits`, reset in flush); later uploads take the per-submit buff
 Also: hwr texture cache entries unused for 50 frames are recycled by size (texture, view and groups kept) instead of making a texture per
 movie picture. Debug: `[gpu] submits by site` at exit.
 App version 1.1 (AndroidManifest versionName, versionCode 2), shown under the title in the settings.
+
+## M6 (Harry Potter 2, weak tile GPU): DATE (2026-11-27)
+
+* **Destination alpha test** (was "FALLBACK DATE": ~2 600 shapes a frame of the heads scene not drawn). A DATE draw reads a copy of its
+  own target (the self-copy mechanism, alpha only) bound as group 2 (hwr.wgsl `dst_copy`, override `DATE`, flag F_DATM) and discards
+  where the copy's alpha top bit differs from DATM. Every pipeline layout has group 2 (a 1x1 texture is bound when no draw needs it).
+* HP2's DATE shapes: projected character shadows (texture: the 128x... shadow target at 0x3B80, CT32) drawn into the 704x576 CT16S buffer
+  at 0x2F20, DATM 0, no blending, no depth write, alpha written: the first shape that reaches a pixel sets its A bit and blocks the
+  shapes after it. With a copy per shape that is ~1 550 copies and render passes a frame. Instead such draws (DATE, alpha written, no
+  blend, no depth write, one draw) are sent to the card in reverse order (`DrawRec::rev`, reversed in schedule()): the first shape is
+  drawn last and wins its pixels, and all shapes of the run read one copy. Assumption: the alpha written fails DATM (exact for these
+  shadows). Other DATE draws keep their written triangles (`Target::date_tris`); a DATE shape that overlaps none of them (separating-axis
+  test) reads the same copy. A copy made for a DATE draw also takes the whole written rectangles it meets, so they are clean afterwards.
+* Check: the 0x2F20 buffer after frame 5700 (PS2_VRAM_DUMP) is identical with the reversed draws and with a copy per shape
+  (PS2_HWR_DATE_REVERSE=0 PS2_HWR_DATE_TRIS=0). The presented frames 5600/5700/5800 are bit-identical with and without DATE: in this
+  scene the composite of 0x2F20 into the frame does not show the shadow pixels (5 840 pixels of 0x2F20 differ). The exact renderer's
+  0x2F20 has none of these shadow pixels at frame 5700 (its 0x3B80 shadow target has 3 860 fewer pixels with alpha 0x80 than hw's): an
+  upstream difference of the shadow target, not of DATE.
+* Cost (heads scene, per drawn frame): render passes 43 -> 62.6, attachment loads 27.6 -> 59.7 MB, stores 26.6 -> 58.7 MB, self copies
+  17 -> 31.6 (each character's shadow run is a 0x2F20 pass with the frame's depth, between the passes of its shadow target).
+* Switches: `PS2_HWR_DATE=0` (DATE shapes not drawn, as before), `PS2_HWR_DATE_REVERSE=0` (no reversed draws), `PS2_HWR_DATE_TRIS=0`
+  (any DATE alpha write under a shape's rectangle makes a new copy).
+
+## M6: texture decodes and render passes (2026-11-27)
+
+* **Texture decodes, measured** (heads scene, PS2_HWR_LOG=4, per drawn frame): 78 misses, 934 k texels, 228 mip levels. 58 of them
+  (690 k texels, 174 levels) are FROM-TARGET: mip chains the game renders into the frame's corner (address 0, T8/T4) and reads back,
+  written back to memory and decoded each frame; 10 more (118 k texels) read pages a target drew into (STALE). Only 10 textures (126 k
+  texels, 27 levels) are uploaded data. Card cost on the PC (PS2_HWR_TIME): the decode compute pass ~0.36 ms (with the uploads and
+  palette loads), ~105 level copies ~0.85 ms (timed with two empty compute passes each, so inflated). A decode on the processor is not done:
+  hw mode keeps no processor copy of graphics memory or of the palettes (gs.cpp g_memory is only kept for the processor rasterizer), and
+  88 % of the texels come from pictures that only the card holds, so it could serve 13 % of the work while adding a memory mirror and the
+  decode to the drawing thread, which is the busy one. PS2_HWR_DIRECT_MIPMAP=1 (view 4 for mipmapped reads) changes nothing here (same
+  counts, same frames): the corner's levels are not all held by the frame target.
+* **Dirty spans** (`PS2_HWR_DIRTY_GRID`, default on): what was drawn into a target since its copy is kept per pair of rows as a column
+  span (DirtyGrid). The rectangle lists merged HP2's 64x2 shift strips (the 704x576 buffer at 0x2F20 moved up 2 rows, reading the rows
+  below) into one box per column once they were 32, so each 64-pixel column made a copy and a render pass of the buffer. A copy made for a
+  stale read also takes everything written since the last copy.
+* **Read snapshots** (`PS2_HWR_READ_SNAP`, default on): a draw into a target at least 4 times larger than the target it reads (DATE
+  shadows into 0x2F20 reading each character's 128x128 shadow target at 0x3B80) reads a copy of the small target made at that point
+  (64-128 KB), so the large target's draws need not come before the small target's later draws.
+* **Schedule** (`PS2_HWR_SCHED_COPIES`, default on): when choosing the next render pass, copies whose inputs are reachable count as
+  reachable, so a small target that reads copies of itself counts as complete and is drawn before a large target's node that came first in
+  the stream. The 12 shadow targets now come before the frame's and 0x2F20's late passes; 0x2F20's DATE runs are 2 passes instead of 5.
+* DATE overlap test: the triangle lists keep their bounding box (TriList), limit 4096 triangles (was 256, which made a copy at the start
+  of every character's run).
+* Numbers (heads scene, per drawn frame, PS2_HWR_LOG): DATE skipped (as before): 43 passes, 27.6 / 26.6 MB loaded / stored, 17 self
+  copies (all switches above change nothing there). DATE drawn, old structure (PS2_HWR_DIRTY_GRID=0 PS2_HWR_READ_SNAP=0
+  PS2_HWR_SCHED_COPIES=0): 60-63 passes, 54-60 / 53-59 MB, 29-32 copies. DATE drawn, new: 49 passes, 35.5 / 34.5 MB, 23 copies
+  (4.2 MB). Frames 5600/5700/5800 bit-identical in every configuration.
+* Left: the frame (0000, 704x576 with depth) is still cut into ~7 passes (~6 MB of attachment traffic each): three write-backs to memory
+  for the corner's mip chains (anchored among the compute work) and the late 0x2F20 passes between; WebGPU's read-only depth is loaded
+  and stored by wgpu anyway (wgpu-core maps it to Load + Store), so it saves nothing.

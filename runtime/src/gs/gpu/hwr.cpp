@@ -224,6 +224,7 @@ struct Surf {
     WGPUTexture tex = nullptr;
     WGPUTextureView view = nullptr;
     WGPUBindGroup sample_group = nullptr, sync_group = nullptr;
+    WGPUBindGroup date_group = nullptr;  // group 2 of a DATE draw that reads this surface as its destination copy (made when first needed)
     u32 w = 0, h = 0;
     Sc sc;
     bool depth = false;
@@ -236,10 +237,92 @@ std::vector<Surf *> g_retired;                     // given up in this submit: b
 u64 g_res = 1;                                     // resource id counter (surfaces and cache textures)
 
 // ---------------------------------------------------------------- targets
+struct Tri {
+    float x[3], y[3];
+};
+// triangles with their bounding box (a quick test before the separating-axis test of each one)
+struct TriList {
+    std::vector<Tri> v;
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    std::size_t size() const { return v.size(); }
+    bool empty() const { return v.empty(); }
+    void clear() { v.clear(), x0 = y0 = 1e30f, x1 = y1 = -1e30f; }
+    void push_back(const Tri &t) {
+        v.push_back(t);
+        for (int k = 0; k < 3; ++k) x0 = std::min(x0, t.x[k]), x1 = std::max(x1, t.x[k]), y0 = std::min(y0, t.y[k]), y1 = std::max(y1, t.y[k]);
+    }
+    void append(const TriList &o) {
+        for (const Tri &t : o.v) push_back(t);
+    }
+    bool box_hits(const Tri &t) const {
+        const float a0 = std::min({t.x[0], t.x[1], t.x[2]}), a1 = std::max({t.x[0], t.x[1], t.x[2]}), b0 = std::min({t.y[0], t.y[1], t.y[2]}), b1 = std::max({t.y[0], t.y[1], t.y[2]});
+        return !v.empty() && a0 < x1 && x0 < a1 && b0 < y1 && y0 < b1;
+    }
+};
 struct Rect {
     int x0, y0, x1, y1;
     bool hits(const Rect &o) const { return x0 <= o.x1 && o.x0 <= x1 && y0 <= o.y1 && o.y0 <= y1; }
 };
+// What was drawn into a target since its copy, per pair of rows: the span of columns written (PS2_HWR_DIRTY_GRID, default on). Exact
+// enough that a run of strips that reads rows the run has not written yet (Harry Potter 2 moves its 704x576 effect buffer up by 2 rows:
+// 64x2 strips going down each 64-pixel column, each reading the 2 rows below) needs no new copy: the rectangle lists merged those strips
+// into one box per column once they were 32, so every column made a copy and broke the render pass (11 passes of that buffer a frame).
+// A row's span only grows (two writes far apart in one row cover what lies between: conservative).
+struct DirtyGrid {
+    static constexpr int kCw = 1, kCh = 2;
+    std::vector<int> lo, hi;  // per row pair: columns written [lo, hi], lo > hi: none
+    int rows = 0, n = 0;      // n: row pairs with a span
+    void clear() {
+        if (n) std::fill(lo.begin(), lo.end(), 1 << 30), std::fill(hi.begin(), hi.end(), -1);
+        n = 0;
+    }
+    void fit(int, int h) {
+        const int nr = (h + kCh - 1) / kCh;
+        if (nr != rows) rows = nr, lo.assign(static_cast<std::size_t>(nr), 1 << 30), hi.assign(static_cast<std::size_t>(nr), -1), n = 0;
+    }
+    bool span(const Rect &r, int &y0, int &y1) const {
+        y0 = std::max(r.y0, 0) / kCh, y1 = std::min(r.y1 / kCh, rows - 1);
+        return r.y1 >= 0 && r.x1 >= 0 && y0 <= y1 && r.x0 <= r.x1;
+    }
+    void mark(const Rect &r) {
+        int y0, y1;
+        if (!span(r, y0, y1)) return;
+        const int x0 = std::max(r.x0, 0);
+        for (int y = y0; y <= y1; ++y) {
+            if (lo[static_cast<std::size_t>(y)] > hi[static_cast<std::size_t>(y)]) ++n;
+            lo[static_cast<std::size_t>(y)] = std::min(lo[static_cast<std::size_t>(y)], x0), hi[static_cast<std::size_t>(y)] = std::max(hi[static_cast<std::size_t>(y)], r.x1);
+        }
+    }
+    bool hits(const Rect &r) const {
+        int y0, y1;
+        if (!n || !span(r, y0, y1)) return false;
+        for (int y = y0; y <= y1; ++y)
+            if (lo[static_cast<std::size_t>(y)] <= r.x1 && r.x0 <= hi[static_cast<std::size_t>(y)]) return true;
+        return false;
+    }
+    Rect bbox() const {  // of what is written (pixels); x1 < 0 when nothing
+        Rect b{1 << 30, 1 << 30, -1, -1};
+        if (!n) return b;
+        for (int y = 0; y < rows; ++y)
+            if (lo[static_cast<std::size_t>(y)] <= hi[static_cast<std::size_t>(y)])
+                b.x0 = std::min(b.x0, lo[static_cast<std::size_t>(y)]), b.x1 = std::max(b.x1, hi[static_cast<std::size_t>(y)]), b.y0 = std::min(b.y0, y * kCh),
+                b.y1 = std::max(b.y1, y * kCh + kCh - 1);
+        return b;
+    }
+    void unmark(const Rect &r) {  // r row-pair aligned (or reaching past the last row): what it covers is clean
+        int y0, y1;
+        if (!n || !span(r, y0, y1)) return;
+        for (int y = y0; y <= y1; ++y) {
+            int &l = lo[static_cast<std::size_t>(y)], &h = hi[static_cast<std::size_t>(y)];
+            if (l > h || h < r.x0 || r.x1 < l) continue;
+            if (r.x0 <= l && h <= r.x1) l = 1 << 30, h = -1, --n;
+            else if (r.x0 <= l) l = r.x1 + 1;
+            else if (h <= r.x1) h = r.x0 - 1;
+        }
+    }
+};
+const bool g_dirty_grid = os::env("PS2_HWR_DIRTY_GRID") != "0";
+
 struct Target {
     u32 bp = 0, bw = 0, psm = 0;  // psm: the class for lookups (CT32 for CT24); depth targets keep their Z format
     u32 last_psm = 0;             // the format last drawn (CT24 keeps the top byte when written back)
@@ -253,6 +336,11 @@ struct Target {
     Surf *snap_of = nullptr;      // the surface it was copied from
     std::vector<Rect> dirty;      // what was drawn into the surface since the copy
     std::vector<Rect> dirty_a;    // the part of it whose alpha was written (a draw that reads only the copy's alpha, view 3, needs no new copy for the rest)
+    TriList date_tris;            // DATE draws' alpha writes since the copy, as triangles: a DATE draw that overlaps none of them needs no new copy
+    DirtyGrid grid, grid_a;       // dirty and dirty_a as cells (g_dirty_grid)
+    Surf *rsnap = nullptr;        // a copy of the picture read by draws into a larger target (read_snapshot), of surface rsnap_of after rsnap_writes draws
+    Surf *rsnap_of = nullptr;
+    u64 rsnap_writes = 0;
     std::vector<u64> page_snap_frame;  // view-4 self reads: per page of the target, the frame its part of the copy was brought up to date in
                                        // (+1; read as of then for the rest of that frame, as store_for_memory once_per_frame writes a page back)
     u64 writes = 0, stored = ~0ull;  // draws into it so far, and how many of them the last write-back to memory (store_for_memory) had
@@ -266,6 +354,10 @@ struct Target {
     u32 fs_keep_gen = 0;
 };
 std::vector<std::unique_ptr<Target>> g_targets;
+// the DATE draw being recorded in reverse (DrawRec::rev): its triangles, its index in g_draws and its target
+TriList g_date_open_tris;
+std::size_t g_date_open_draw = ~std::size_t{0};
+int g_date_open_target = -1;
 std::vector<WGPUTexture> g_release_tex;
 std::vector<WGPUTextureView> g_release_view;
 std::vector<WGPUBindGroup> g_release_group;
@@ -308,6 +400,9 @@ struct DrawRec {
     float blend = 0;
     u32 first = 0, count = 0;
     u64 res = 0;         // the resource (surface or cache texture) it samples, 0 none
+    WGPUBindGroup dgroup = nullptr;  // DATE: group 2, the copy of the destination it tests (nullptr: none)
+    u64 res2 = 0;        // that copy's resource
+    bool rev = false;    // DATE draw whose triangles go to the card in reverse order (schedule(): the first writer of a pixel wins, as with the GS's DATE)
     bool zuse = false;   // it needs the depth attachment (test or write)
     bool zread = false;  // it reads depth (a test other than ALWAYS)
 };
@@ -373,6 +468,10 @@ WGPUShaderModule g_module = nullptr, g_sync_module = nullptr;
 // CT16 and CT16S: halfword -> x | y << 8), made once from gpu.cpp's copy.
 constexpr u32 kInv32 = 45056, kInv16 = kInv32 + 2048, kInv16S = kInv16 + 4096, kAddrWords = kInv16S + 4096;
 WGPUBuffer g_addr = nullptr;
+WGPUBindGroupLayout g_date_layout = nullptr;  // group 2: the destination copy of a DATE draw
+WGPUBindGroup g_dummy_date_group = nullptr;   // group 2 of every other draw
+// PS2_HWR_DATE=0: shapes with the destination alpha test are not drawn (counted as FALLBACK DATE), as before
+const bool g_date_on = os::env("PS2_HWR_DATE") != "0";
 WGPUBindGroupLayout g_params_layout = nullptr, g_tex_layout = nullptr, g_store_layout = nullptr, g_load_layout = nullptr, g_depth_layout = nullptr;
 WGPUPipelineLayout g_draw_layout = nullptr;
 WGPUComputePipeline g_load_pipe = nullptr, g_store_pipe = nullptr, g_store_z_pipe = nullptr;
@@ -389,15 +488,17 @@ struct PipeKey {
     u32 mask = 0xF;
     bool depth = false, zwrite = false;
     u32 zcmp = WGPUCompareFunction_Always;
+    bool date = false;  // destination alpha test (hwr.wgsl DATE: reads the copy bound as group 2)
     u64 pack() const {
         return static_cast<u64>(tex) | static_cast<u64>(atest) << 2 | static_cast<u64>(dual) << 4 | static_cast<u64>(blend) << 5 | static_cast<u64>(src) << 6 |
                static_cast<u64>(dst) << 11 | static_cast<u64>(op) << 16 | static_cast<u64>(mask) << 19 | static_cast<u64>(depth) << 23 | static_cast<u64>(zwrite) << 24 |
-               static_cast<u64>(zcmp) << 25;
+               static_cast<u64>(zcmp) << 25 | static_cast<u64>(date) << 29;
     }
     static PipeKey unpack(u64 v) {
         PipeKey k;
         k.tex = v & 3u, k.atest = (v >> 2) & 3u, k.dual = (v >> 4) & 1u, k.blend = (v >> 5) & 1u, k.src = (v >> 6) & 31u, k.dst = (v >> 11) & 31u;
         k.op = (v >> 16) & 7u, k.mask = (v >> 19) & 15u, k.depth = (v >> 23) & 1u, k.zwrite = (v >> 24) & 1u, k.zcmp = (v >> 25) & 15u;
+        k.date = (v >> 29) & 1u;
         return k;
     }
 };
@@ -437,13 +538,16 @@ WGPURenderPipeline pipeline(const PipeKey &k) {
     vl.stepMode = WGPUVertexStepMode_Vertex;
     vl.attributeCount = 6;
     vl.attributes = at;
-    WGPUConstantEntry consts[2];
+    WGPUConstantEntry consts[3];
     consts[0] = WGPU_CONSTANT_ENTRY_INIT;
     consts[0].key = sv("TEX");
     consts[0].value = k.tex;
     consts[1] = WGPU_CONSTANT_ENTRY_INIT;
     consts[1].key = sv("ATEST");
     consts[1].value = k.atest;
+    consts[2] = WGPU_CONSTANT_ENTRY_INIT;
+    consts[2].key = sv("DATE");
+    consts[2].value = k.date ? 1.0 : 0.0;
     WGPUBlendState bs = WGPU_BLEND_STATE_INIT;
     bs.color.srcFactor = static_cast<WGPUBlendFactor>(k.src);
     bs.color.dstFactor = static_cast<WGPUBlendFactor>(k.dst);
@@ -458,7 +562,7 @@ WGPURenderPipeline pipeline(const PipeKey &k) {
     WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
     fs.module = g_module;
     fs.entryPoint = sv(C.gl ? (k.dual ? "fs_dual_gl" : "fs_gl") : (k.dual ? "fs_dual" : "fs"));
-    fs.constantCount = 2;
+    fs.constantCount = 3;
     fs.constants = consts;
     fs.targetCount = 1;
     fs.targets = &ct;
@@ -528,6 +632,17 @@ WGPUBindGroup sync_group(WGPUBindGroupLayout layout, WGPUTextureView view) {
     e.textureView = view;
     WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     d.layout = layout;
+    d.entryCount = 1;
+    d.entries = &e;
+    return wgpuDeviceCreateBindGroup(C.device, &d);
+}
+
+WGPUBindGroup date_group(WGPUTextureView view) {
+    WGPUBindGroupEntry e = WGPU_BIND_GROUP_ENTRY_INIT;
+    e.binding = 0;
+    e.textureView = view;
+    WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    d.layout = g_date_layout;
     d.entryCount = 1;
     d.entries = &e;
     return wgpuDeviceCreateBindGroup(C.device, &d);
@@ -647,6 +762,11 @@ void drop_snap(Target &t) {
     t.snap = t.snap_of = nullptr;
     t.dirty.clear();
     t.dirty_a.clear();
+    t.grid.clear();
+    t.grid_a.clear();
+    t.date_tris.clear();
+    if (g_date_open_target >= 0 && g_targets[static_cast<std::size_t>(g_date_open_target)].get() == &t)
+        g_date_open_tris.clear(), g_date_open_draw = ~std::size_t{0}, g_date_open_target = -1;
 }
 
 void release_target(int i) {
@@ -655,6 +775,8 @@ void release_target(int i) {
     t.alive = false;
     retire(t.s);
     drop_snap(t);
+    retire(t.rsnap);
+    t.rsnap = t.rsnap_of = nullptr;
     for (int k = 0; k < static_cast<int>(kPages); ++k)
         if (g_owner[k] == i) g_owner[k] = -1;
     g_dead_slots.push_back(i);
@@ -985,6 +1107,7 @@ struct DrawState {
     bool needs_depth = false, zwrite_any = false, cwrite_any = false, awrite_any = false, color_full = false;
     bool self_read = false;
     bool zread = false;
+    bool date = false;  // destination alpha test: the draw reads a copy of its target (shape(): self_copy) and keeps the pixels whose alpha passes
 };
 DrawState g_ds;
 
@@ -1299,6 +1422,7 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
     s.skip = 0;
     s.src = Source{};
     s.self_read = false;
+    s.date = false;
     s.color = s.depth = -1;
     const u32 flags = w[0], fbp = w[1], fbw = w[2], fpsm = w[3], fbmsk = w[4], zbp = w[5], zpsm = w[6], modes = w[7];
     if (prim < 3) return fail(s, kPrimKind);
@@ -1308,9 +1432,12 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
             static std::unordered_map<u32, u32> seen;
             const u32 key = fpsm | (modes & 0xFF) << 8 | (flags & 0xFFFFu) << 16;
             const u32 n = ++seen[key];
-            if (n == 1 || n == 1000 || n == 100000) std::fprintf(stderr, "[hwr-date] fpsm %02X DATM %u flags %05X modes %08X zte %d (count %u)\n", fpsm, (modes >> 20) & 1u, flags, modes, (flags & 512u) ? 1 : 0, n);
+            if (n == 1 || n == 1000 || n == 100000)
+                std::fprintf(stderr, "[hwr-date] fbp %04X fpsm %02X fbmsk %08X DATM %u flags %05X modes %08X aref %02X tex %04X/%u psm %02X (count %u)\n", fbp, fpsm, fbmsk, (flags >> 8) & 1u,
+                             flags, modes, w[8] & 0xFFu, w[12], w[13], w[14], n);
         }
-        return fail(s, kDate);
+        if (!g_date_on) return fail(s, kDate);
+        s.date = true;
     }
     if (fpsm != 0x00 && fpsm != 0x01 && fpsm != 0x02 && fpsm != 0x0A) return fail(s, kFramePsm);
     if (fbw == 0) return fail(s, kZeroWidth);
@@ -1436,6 +1563,7 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
     if (uses_as && !C.dual) f |= 512u;
     if (premul) f |= premul == 1 ? 1024u : 2048u;
     if (is16(fpsm) && (!base.blend || premul)) f |= premul == 2 ? 8192u : 4096u;
+    if (s.date && (flags & 256u)) f |= 16384u;  // F_DATM
     p[0] = f;
     p[1] = ((modes >> 20) & 3u) | (atst << 2) | (((modes >> 24) & 3u) << 8) | (((modes >> 26) & 3u) << 10) | (s.src.view << 12);
     p[2] = w[8];
@@ -1477,6 +1605,7 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
     const u32 tk = s.src.kind == 1 ? 1u : s.src.kind == 2 ? 2u : 0u;
     PipeKey k = base;
     k.tex = tk;
+    k.date = s.date;
     k.depth = false;  // set per pass (encode time decides from the pass's attachments)
     k.zcmp = !zte || ztst == 1 ? WGPUCompareFunction_Always : ztst == 2 ? WGPUCompareFunction_GreaterEqual : WGPUCompareFunction_Greater;
     s.k1 = k;
@@ -1561,6 +1690,12 @@ void note_write(Target &t, int x0, int y0, int x1, int y1, bool alpha) {
     ++t.writes;
     if (!t.snap) return;
     const Rect r{x0, y0, x1, y1};
+    if (g_dirty_grid) {
+        t.grid.fit(static_cast<int>(t.w), static_cast<int>(t.h));
+        t.grid.mark(r);
+        if (alpha) t.grid_a.fit(static_cast<int>(t.w), static_cast<int>(t.h)), t.grid_a.mark(r);
+        return;
+    }
     add_dirty(t.dirty, r);
     if (alpha) add_dirty(t.dirty_a, r);
 }
@@ -1570,8 +1705,27 @@ void note_write(Target &t, int x0, int y0, int x1, int y1, bool alpha) {
 // alpha_only: the draw reads only the copy's alpha (a T8H palette conversion, view 3, that writes the colour of the same target with its
 // alpha masked: Harry Potter 2 draws ~200 of them a frame). Writes that left alpha alone do not make the copy old for it, so the draws
 // share one copy and one render pass instead of a copy and a pass break each. PS2_HWR_ALPHA_SNAP=0 turns it off.
-WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res, bool alpha_only, bool frame_stale = false) {
+void add_dirty(std::vector<Rect> &list, const Rect &r);
+// the DATE draws' written triangles become written rectangles (a reader that is not a DATE draw, or a DATE draw that overlaps them)
+void flush_date_tris(Target &t) {
+    if (g_date_open_target >= 0 && g_targets[static_cast<std::size_t>(g_date_open_target)].get() == &t) {
+        t.date_tris.append(g_date_open_tris);
+        g_date_open_tris.clear();
+        g_date_open_draw = ~std::size_t{0};
+        g_date_open_target = -1;
+    }
+    for (const Tri &q : t.date_tris.v) {
+        const Rect r{static_cast<int>(std::floor(std::min({q.x[0], q.x[1], q.x[2]}))), static_cast<int>(std::floor(std::min({q.y[0], q.y[1], q.y[2]}))),
+                     static_cast<int>(std::ceil(std::max({q.x[0], q.x[1], q.x[2]}))), static_cast<int>(std::ceil(std::max({q.y[0], q.y[1], q.y[2]})))};
+        if (g_dirty_grid) t.grid_a.fit(static_cast<int>(t.w), static_cast<int>(t.h)), t.grid_a.mark(r);
+        else add_dirty(t.dirty_a, r);
+    }
+    t.date_tris.clear();
+}
+
+WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res, bool alpha_only, bool frame_stale = false, bool date = false) {
     Target &t = *g_targets[static_cast<std::size_t>(ti)];
+    if (!date) flush_date_tris(t);
     static const bool alpha_snap = os::env("PS2_HWR_ALPHA_SNAP") != "0";
     // frame_stale (a view-4 read of the target being drawn, r page-aligned): page by page as the write-back path reads its target
     // (store_for_memory once_per_frame): a page's part of the copy is brought up to date at its first read in a frame and read as it is for
@@ -1596,7 +1750,7 @@ WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res, bool alpha_only, bool f
             op.tgt = ti;
             ++F.self_copies;
             F.copy_bytes += static_cast<u64>(card_x(t.w, t.sc)) * card_y(t.h, t.sc) * 4;
-            t.dirty.clear(), t.dirty_a.clear();
+            t.dirty.clear(), t.dirty_a.clear(), t.grid.clear(), t.grid_a.clear();
             std::fill(t.page_snap_frame.begin(), t.page_snap_frame.end(), 0);
         }
         bool stale = false;
@@ -1633,8 +1787,10 @@ WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res, bool alpha_only, bool f
         return t.snap->sample_group;
     }
     bool fresh = t.snap && t.snap_of == t.s;
-    if (fresh)
-        for (const Rect &d : alpha_only && alpha_snap ? t.dirty_a : t.dirty)
+    const bool use_a = alpha_only && alpha_snap;
+    if (fresh && g_dirty_grid) fresh = !(use_a ? t.grid_a : t.grid).hits(r);
+    else if (fresh)
+        for (const Rect &d : use_a ? t.dirty_a : t.dirty)
             if (d.hits(r)) {
                 fresh = false;
                 break;
@@ -1647,9 +1803,23 @@ WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res, bool alpha_only, bool f
     Rect pr{std::max(r.x0, 0), std::max(r.y0, 0), std::min(r.x1, vw - 1), std::min(r.y1, vh - 1)};
     // the part copied reaches over all the rows of the written rectangles it meets, so that they can be cut back to what lies beside it
     // (one copy for a column of strips, not one per strip)
-    if (!fresh && partial)
-        for (const Rect &d : alpha_only && alpha_snap ? t.dirty_a : t.dirty)
-            if (d.hits(pr)) pr.y0 = std::max(0, std::min(pr.y0, d.y0)), pr.y1 = std::min(vh - 1, std::max(pr.y1, d.y1));
+    if (!fresh && partial && g_dirty_grid) {  // the cells the read touches (the grid's cells are cleaned whole)
+        // everything written since the copy too: the draws after this one then need no copy each (a run of strips that reads rows written
+        // before the run, a run of DATE shapes)
+        {
+            const Rect b = (use_a ? t.grid_a : t.grid).bbox();
+            if (b.x1 >= 0) pr.x0 = std::min(pr.x0, b.x0), pr.y0 = std::min(pr.y0, b.y0), pr.x1 = std::min(vw - 1, std::max(pr.x1, b.x1)), pr.y1 = std::min(vh - 1, std::max(pr.y1, b.y1));
+        }
+        pr.x0 -= pr.x0 % DirtyGrid::kCw, pr.y0 -= pr.y0 % DirtyGrid::kCh;
+        pr.x1 = std::min(vw - 1, pr.x1 - pr.x1 % DirtyGrid::kCw + DirtyGrid::kCw - 1), pr.y1 = std::min(vh - 1, pr.y1 - pr.y1 % DirtyGrid::kCh + DirtyGrid::kCh - 1);
+    } else if (!fresh && partial)
+        for (const Rect &d : use_a ? t.dirty_a : t.dirty)
+            if (d.hits(pr)) {
+                pr.y0 = std::max(0, std::min(pr.y0, d.y0)), pr.y1 = std::min(vh - 1, std::max(pr.y1, d.y1));
+                // a DATE draw: the whole written rectangle (its columns too), so that it is clean afterwards (the next DATE shapes beside it
+                // would each copy their part of it again)
+                if (date) pr.x0 = std::max(0, std::min(pr.x0, d.x0)), pr.x1 = std::min(vw - 1, std::max(pr.x1, d.x1));
+            }
     if (!fresh && partial && t.snap && t.snap_of == t.s && pr.x0 <= pr.x1 && pr.y0 <= pr.y1 &&
         static_cast<long>(pr.x1 - pr.x0 + 1) * (pr.y1 - pr.y0 + 1) * 2 < static_cast<long>(vw) * vh) {
         const u32 cx0 = card_at_x(static_cast<u32>(pr.x0), t.sc), cy0 = card_at_y(static_cast<u32>(pr.y0), t.sc);
@@ -1667,6 +1837,14 @@ WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res, bool alpha_only, bool f
             op.tgt = ti;
             ++F.self_copies;
             F.copy_bytes += static_cast<u64>(op.w) * op.h * 4;
+            if (g_dirty_grid) {
+                // cells cut by the valid area's edge count as copied whole (nothing outside it is read)
+                const Rect cr{pr.x0, pr.y0, pr.x1 + 1 >= vw ? 1 << 30 : pr.x1, pr.y1 + 1 >= vh ? 1 << 30 : pr.y1};
+                t.grid.unmark(cr);
+                t.grid_a.unmark(cr);
+                res = t.snap->id;
+                return t.snap->sample_group;
+            }
             const auto inside = [&](const Rect &d) { return d.x0 >= pr.x0 && d.x1 <= pr.x1 && d.y0 >= pr.y0 && d.y1 <= pr.y1; };
             t.dirty.erase(std::remove_if(t.dirty.begin(), t.dirty.end(), inside), t.dirty.end());
             t.dirty_a.erase(std::remove_if(t.dirty_a.begin(), t.dirty_a.end(), inside), t.dirty_a.end());
@@ -1707,6 +1885,36 @@ WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res, bool alpha_only, bool f
     return t.snap->sample_group;
 }
 
+// A draw into a large target that reads a small one (Harry Potter 2's shadows: each character's 128x128 shadow target at 0x3B80 read by
+// DATE shapes into the 704x576 buffer at 0x2F20, between that shadow target's own draws) reads a copy of it made at that point: then the
+// large target's draws do not have to come before the small target's later draws, and the schedule keeps them in fewer render passes
+// (each pass of a 704x576 target and its depth loads and stores ~6 MB on a tile GPU; the copy is 64-128 KB). The copy is made again when
+// the small target was drawn into since. PS2_HWR_READ_SNAP=0 turns it off.
+const bool g_read_snap = os::env("PS2_HWR_READ_SNAP") != "0";
+WGPUBindGroup read_snapshot(int ti, u64 &res) {
+    Target &t = *g_targets[static_cast<std::size_t>(ti)];
+    if (!t.rsnap || t.rsnap_of != t.s || t.rsnap_writes != t.writes) {
+        retire(t.rsnap);
+        t.rsnap = get_surf(t.w, t.h, false, t.sc);
+        t.rsnap_of = t.s;
+        t.rsnap_writes = t.writes;
+        const u32 w = static_cast<u32>(std::clamp<int>(t.valid_w, 1, static_cast<int>(t.w))), h = static_cast<u32>(std::clamp<int>(t.valid_h, 1, static_cast<int>(t.h)));
+        Op &op = add_op(kOpSelfCopy);
+        op.tex = t.s->tex;
+        op.tex2 = t.rsnap->tex;
+        op.w = w;
+        op.h = h;
+        op.sc = t.sc;
+        op.rd = t.s->id;
+        op.wr = t.rsnap->id;
+        op.tgt = ti;
+        ++F.self_copies;
+        F.copy_bytes += static_cast<u64>(card_x(w, t.sc)) * card_y(h, t.sc) * 4;
+    }
+    res = t.rsnap->id;
+    return t.rsnap->sample_group;
+}
+
 // the texels a shape can read from a target (texel loads, docs: TEX=2): from the corners' coordinates for FST shapes, else all of it
 Rect read_rect(const u32 *w, const Vertex *v, int n, int tw, int th) {
     const u32 flags = w[0], modes = w[7];
@@ -1741,10 +1949,8 @@ Rect read_rect(const u32 *w, const Vertex *v, int n, int tw, int th) {
 // Two-pass draws (alpha test whose failures still write) draw all passing pixels of a merged draw, then all failing ones. That is the GS's
 // order only when no two shapes of the draw cover the same pixel, so a draw takes a shape only when it overlaps none of the draw's shapes
 // (separating axis test on the triangles; shapes that only touch along an edge or a corner share no pixel). At most kSplitTris per draw.
-struct Tri {
-    float x[3], y[3];
-};
 std::vector<Tri> g_split_tris;
+constexpr std::size_t kDateTris = 4096;  // DATE triangles kept per target before a new copy is made anyway (the overlap test's cost)
 constexpr std::size_t kSplitTris = 96;
 
 bool separated(const Tri &a, const Tri &b) {
@@ -1947,9 +2153,17 @@ bool init(const Context &ctx) {
         g_load_layout = make_layout(&l, 1);
     }
     {
-        WGPUBindGroupLayout layouts[2] = {g_params_layout, g_tex_layout};
+        WGPUBindGroupLayoutEntry e = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+        e.binding = 0;
+        e.visibility = WGPUShaderStage_Fragment;
+        e.texture.sampleType = WGPUTextureSampleType_Float;
+        e.texture.viewDimension = WGPUTextureViewDimension_2D;
+        g_date_layout = make_layout(&e, 1);
+    }
+    {
+        WGPUBindGroupLayout layouts[3] = {g_params_layout, g_tex_layout, g_date_layout};
         WGPUPipelineLayoutDescriptor pd = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
-        pd.bindGroupLayoutCount = 2;
+        pd.bindGroupLayoutCount = 3;
         pd.bindGroupLayouts = layouts;
         g_draw_layout = wgpuDeviceCreatePipelineLayout(C.device, &pd);
     }
@@ -1967,6 +2181,7 @@ bool init(const Context &ctx) {
         g_dummy = wgpuDeviceCreateTexture(C.device, &d);
         g_dummy_view = wgpuTextureCreateView(g_dummy, nullptr);
         g_dummy_group = tex_group(g_dummy_view, 0);
+        g_dummy_date_group = date_group(g_dummy_view);
     }
     timer_init();
     // the pipelines of the built-in list and of the recorded list are made now (a pipeline made in the middle of a frame stalls it; tens of
@@ -2250,11 +2465,11 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
     // Clears: the game clears a target with a row of untextured sprites side by side (16 strips of 32 pixels for the 512 wide targets). Such a
     // run is drawn as it comes; when it has covered every page the target holds, its draws are taken back and the target gets a new surface
     // that starts with the clear colour (the render pass's load op): the draws before it and the draws after it no longer depend on each other.
-    const bool clear_part = prim == 6 && !(flags & 2u) && !s.k1.blend && !(flags & 4u) && !k2 && s.k1.atest == 0 && (s.k1.mask == 0 || s.color_full) &&
+    const bool clear_part = prim == 6 && !s.date && !(flags & 2u) && !s.k1.blend && !(flags & 4u) && !k2 && s.k1.atest == 0 && (s.k1.mask == 0 || s.color_full) &&
                             (s.k1.mask || s.k1.zwrite) && (!s.k1.zwrite || (s.k1.zcmp == WGPUCompareFunction_Always && dt && dt->w == ct.w && dt->h == ct.h));
     // the same with textured opaque sprites (the copy of the last picture into the display buffer): the draws stay, the target gets a new
     // surface that the render pass does not load
-    const bool cover_part = prim == 6 && (flags & 2u) && s.src.kind && s.src.target != s.color && !s.k1.blend && !k2 && s.k1.atest == 0 && s.color_full;
+    const bool cover_part = prim == 6 && !s.date && (flags & 2u) && s.src.kind && s.src.target != s.color && !s.k1.blend && !k2 && s.k1.atest == 0 && s.color_full;
     const Vertex &cv = v[1];
     const u32 crgba = cv.r | (static_cast<u32>(cv.g) << 8) | (static_cast<u32>(cv.b) << 16) | (static_cast<u32>(cv.a) << 24);
     ClearRun &cr = g_clear;
@@ -2297,7 +2512,77 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
             }
             group = self_copy(s.src.target, rr, res, s.src.view == 3, s.src.view == 4);
         }
+        else if (g_read_snap && s.src.target >= 0 && g_targets[static_cast<std::size_t>(s.src.target)] &&
+                 static_cast<u64>(g_targets[static_cast<std::size_t>(s.src.target)]->w) * g_targets[static_cast<std::size_t>(s.src.target)]->h * 4 <= static_cast<u64>(ct.w) * ct.h)
+            group = read_snapshot(s.src.target, res);
         else group = s.src.group, res = s.src.res;
+    }
+    // DATE: the target's alpha as it is before this shape (a copy, brought up to date where alpha was written since the last one).
+    // A DATE draw that writes alpha (and neither blends nor writes depth) lets only the first shape that reaches a pixel draw it (the alpha it
+    // writes fails the test of the shapes after it). Its triangles are sent to the card in reverse order (DrawRec::rev): the last triangle
+    // drawn, which is the first shape, wins every pixel, and all those shapes read one copy. Assumed: the alpha written fails DATM (true for
+    // Harry Potter 2's shadows; PS2_HWR_DATE_REVERSE=0 turns it off). Other DATE draws keep their written triangles: a DATE shape that
+    // overlaps none of them reads the same copy, otherwise a new copy (a render pass break) is made.
+    WGPUBindGroup dgroup = nullptr;
+    u64 res2 = 0;
+    Tri dtris[2];
+    int ndtris = 0;
+    bool date_rev = false, date_join = false;
+    if (s.date) {
+        u32 dsc[4] = {static_cast<u32>(std::max(s.sc[0], 0)), static_cast<u32>(std::max(s.sc[1], 0)), 0, 0};
+        const u32 dex = static_cast<u32>(std::max(std::min(s.sc[2] + 1, W), 0)), dey = static_cast<u32>(std::max(std::min(s.sc[3] + 1, H), 0));
+        dsc[2] = dex > dsc[0] ? dex - dsc[0] : 0;
+        dsc[3] = dey > dsc[1] ? dey - dsc[1] : 0;
+        if (prim == 6) {
+            dtris[0] = Tri{{px[0], px[1], px[0]}, {py[0], py[0], py[1]}};
+            dtris[1] = Tri{{px[1], px[1], px[0]}, {py[0], py[1], py[1]}};
+            ndtris = 2;
+        } else {
+            dtris[0] = Tri{{px[0], px[1], px[2]}, {py[0], py[1], py[2]}};
+            ndtris = 1;
+        }
+        static const bool reverse = os::env("PS2_HWR_DATE_REVERSE") != "0";
+        date_rev = reverse && !k2 && !s.k1.blend && !s.zwrite_any && s.awrite_any;
+        if (date_rev && g_open_pass >= 0 && g_date_open_target == s.color && !g_draws.empty() && g_date_open_draw == g_draws.size() - 1 && ct.snap && ct.snap_of == ct.s) {
+            const Op &op = g_ops[static_cast<std::size_t>(g_open_pass)];
+            const DrawRec &last = g_draws.back();
+            date_join = op.cs == ct.s && op.draw_count && last.rev && last.first + last.count == g_verts.size() && last.k1 == s.kp1 && last.k2 == s.kp2 && last.group == group &&
+                        last.dgroup == ct.snap->date_group && last.blend == s.blend && last.zuse == s.needs_depth && std::equal(dsc, dsc + 4, last.sc) &&
+                        (!s.needs_depth || !op.ds || op.ds == g_targets[static_cast<std::size_t>(s.depth)]->s);
+        }
+        static const bool by_tris = os::env("PS2_HWR_DATE_TRIS") != "0";  // 0: any DATE alpha write in the shape's rectangle makes a new copy
+        // what the card draws before this shape must not share a pixel with it (else a new copy): the earlier draws' triangles, and the open
+        // reversed draw's unless this shape joins it (then the card draws it after them, as the GS's order wants)
+        const bool with_open = !date_join && g_date_open_target == s.color;
+        bool overlap = !by_tris || ct.date_tris.size() + (with_open ? g_date_open_tris.size() : 0) + static_cast<std::size_t>(ndtris) > kDateTris;
+        for (int k = 0; k < ndtris && !overlap; ++k) {
+            if (ct.date_tris.box_hits(dtris[k]))
+                for (const Tri &o : ct.date_tris.v)
+                    if (!separated(dtris[k], o)) {
+                        overlap = true;
+                        break;
+                    }
+            if (with_open && g_date_open_tris.box_hits(dtris[k]))
+                for (const Tri &o : g_date_open_tris.v)
+                    if (!overlap && !separated(dtris[k], o)) overlap = true;
+        }
+        if (overlap) flush_date_tris(ct);
+        const u64 copies = F.self_copies;
+        self_copy(s.color, Rect{x0, y0, x1, y1}, res2, true, false, true);
+        if (F.self_copies != copies || overlap) date_join = false;
+        if (g_dump_now) std::fprintf(stderr, "[hwr-dump] date rev %d join %d overlap %d copied %d tris %zu open %zu dirty_a %zu snap %d\n", date_rev ? 1 : 0, date_join ? 1 : 0, overlap ? 1 : 0, F.self_copies != copies ? 1 : 0, ct.date_tris.size(), g_date_open_tris.size(), static_cast<std::size_t>(ct.grid_a.n), ct.snap_of == ct.s ? 1 : 0);
+        if (!date_join && g_date_open_target >= 0) {  // the open reversed draw is closed: its triangles are an earlier draw's now
+            if (g_targets[static_cast<std::size_t>(g_date_open_target)]) {
+                Target &ot = *g_targets[static_cast<std::size_t>(g_date_open_target)];
+                if (ot.snap) ot.date_tris.append(g_date_open_tris);
+            }
+            g_date_open_tris.clear();
+            g_date_open_draw = ~std::size_t{0};
+            g_date_open_target = -1;
+        }
+        Surf *snap = ct.snap;
+        if (!snap->date_group) snap->date_group = date_group(snap->view);
+        dgroup = snap->date_group;
     }
     if (g_log && s.src.kind == 1 && mip_top && mip[0]) {  // how many levels the corners of this draw can sample (the same bound as the view-4 mip check)
         const u32 m = mip[0];
@@ -2314,9 +2599,11 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
     }
     ensure_pass(s);
     Op &pass = g_ops[static_cast<std::size_t>(g_open_pass)];
-    if (g_dump_now && (s.src.target >= 0 || prim == 6))
-        std::fprintf(stderr, "[hwr-dump] shape t%d %04x/%u prim %u rect %d,%d-%d,%d src t%d view %u uv %d,%d-%d,%d tbp %04x blend %d mask %x zw %d atest %u clearpart %d\n", s.color, ct.bp, ct.bw, prim, x0, y0, x1,
-                     y1, s.src.target, s.src.view, v[0].u >> 4, v[0].v >> 4, v[1].u >> 4, v[1].v >> 4, w[12], s.k1.blend, s.k1.mask, s.k1.zwrite, s.k1.atest, clear_part);
+    if (g_dump_now && (s.src.target >= 0 || prim == 6 || s.date))
+        std::fprintf(stderr, "[hwr-dump] shape t%d %04x/%u prim %u rect %d,%d-%d,%d src t%d view %u uv %d,%d-%d,%d tbp %04x blend %d mask %x zw %d atest %u clearpart %d date %d aw %d copies %llu xy16 %d,%d-%d,%d uv16 %d,%d-%d,%d flags %05X\n", s.color, ct.bp, ct.bw, prim, x0, y0, x1,
+                     y1, s.src.target, s.src.view, v[0].u >> 4, v[0].v >> 4, v[1].u >> 4, v[1].v >> 4, w[12], s.k1.blend, s.k1.mask, s.k1.zwrite, s.k1.atest, clear_part, s.date ? 1 : 0,
+                     s.awrite_any ? 1 : 0, static_cast<unsigned long long>(F.self_copies), static_cast<int>(px[0] * 16), static_cast<int>(py[0] * 16), static_cast<int>(px[1] * 16),
+                     static_cast<int>(py[1] * 16), static_cast<int>(v[0].u), static_cast<int>(v[0].v), static_cast<int>(v[1].u), static_cast<int>(v[1].v), flags);
     // corners in clip space (GS pixel x is the centre of the card's pixel x), as triangles
     const u32 first = static_cast<u32>(g_verts.size());
     const bool fst = flags & 16u, iip = flags & 1u;
@@ -2377,13 +2664,17 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
                     break;
                 }
     }
-    if (pass.draw_count && !overlap) {
+    // a reversed DATE draw takes a shape only when date_join says so; nothing else joins a reversed draw
+    if (pass.draw_count && !overlap && (date_join || !date_rev) && !g_draws.back().rev) {
         DrawRec &last = g_draws.back();
-        if (last.k1 == s.kp1 && last.k2 == s.kp2 && last.group == group && last.blend == s.blend && last.zuse == s.needs_depth && std::equal(sc, sc + 4, last.sc) &&
+        if (last.k1 == s.kp1 && last.k2 == s.kp2 && last.group == group && last.dgroup == dgroup && last.blend == s.blend && last.zuse == s.needs_depth && std::equal(sc, sc + 4, last.sc) &&
             last.first + last.count == first) {
             last.count += nv;
             merged = true;
         }
+    } else if (date_join) {
+        g_draws.back().count += nv;
+        merged = true;
     }
     if (!merged) {
         g_split_tris.clear();
@@ -2392,6 +2683,8 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
         std::copy(sc, sc + 4, r.sc);
         r.first = first, r.count = nv;
         r.res = res;
+        r.dgroup = dgroup, r.res2 = res2;
+        r.rev = date_rev;
         r.zuse = s.needs_depth;
         r.zread = s.zread;
         g_draws.push_back(r);
@@ -2408,7 +2701,17 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
             take_page(s.color, page);
             ++g_page_write[page & (kPages - 1)];
         });
-        note_write(ct, x0, y0, x1, y1, s.awrite_any);
+        note_write(ct, x0, y0, x1, y1, s.awrite_any && !s.date);
+        if (date_rev) {
+            if (!date_join) {  // a new reversed draw (an open one was closed above)
+                g_date_open_tris.clear();
+                g_date_open_draw = g_draws.size() - 1;
+                g_date_open_target = s.color;
+            }
+            for (int k = 0; k < ndtris; ++k) g_date_open_tris.push_back(dtris[k]);
+        } else if (s.date && s.awrite_any && ct.snap) {
+            for (int k = 0; k < ndtris; ++k) ct.date_tris.push_back(dtris[k]);
+        }
     }
     if (s.zwrite_any && dt) {
         dt->valid_w = std::max(dt->valid_w, x1 + 1), dt->valid_h = std::max(dt->valid_h, y1 + 1);
@@ -2707,7 +3010,8 @@ void build_graph(Graph &g) {
         rd.clear(), wr.clear();
         if (op.kind == kOpPass) {
             for (u32 d = op.first_draw; d < op.first_draw + op.draw_count; ++d)
-                if (g_draws[d].res && std::find(rd.begin(), rd.end(), g_draws[d].res) == rd.end()) rd.push_back(g_draws[d].res);
+                for (const u64 r : {g_draws[d].res, g_draws[d].res2})
+                    if (r && std::find(rd.begin(), rd.end(), r) == rd.end()) rd.push_back(r);
             if (op.cs) wr.push_back(op.cs->id);
             if (op.ds) wr.push_back(op.ds->id);
         } else {
@@ -2764,7 +3068,13 @@ void order_group(const Graph &g, const std::vector<int> &ops, std::vector<int> &
         bool all = true;
         for (const int i : ops) {
             const Op &op = g_ops[static_cast<std::size_t>(i)];
-            if (done[static_cast<std::size_t>(i)] || op.kind != kOpPass || op.cs != cs) continue;
+            if (done[static_cast<std::size_t>(i)]) continue;
+            // a copy whose inputs are reachable is reachable too (it runs between this surface's passes): a small target that reads
+            // copies of itself (Harry Potter 2's shadow targets) counts as complete, and is drawn before a large target's node that
+            // happens to come first in the stream (each pass of that one costs far more). PS2_HWR_SCHED_COPIES=0: copies stop it.
+            static const bool through_copies = os::env("PS2_HWR_SCHED_COPIES") != "0";
+            const bool copy = op.kind != kOpPass && through_copies && !anchored(op);
+            if (!copy && (op.kind != kOpPass || op.cs != cs)) continue;
             bool ok = true;
             for (const int p : g.pred[static_cast<std::size_t>(i)])
                 if (in_group[static_cast<std::size_t>(p)] && !done[static_cast<std::size_t>(p)] && !reach[static_cast<std::size_t>(p)]) {
@@ -2772,7 +3082,7 @@ void order_group(const Graph &g, const std::vector<int> &ops, std::vector<int> &
                     break;
                 }
             reach[static_cast<std::size_t>(i)] = ok;
-            if (!ok) all = false;
+            if (!ok && !copy) all = false;
         }
         for (const int i : ops) reach[static_cast<std::size_t>(i)] = 0;
         return all;
@@ -2879,6 +3189,12 @@ void schedule() {
         }
         Graph g;
         build_graph(g);
+        if (g_dump_now)
+            for (std::size_t i = 0; i < n; ++i) {
+                std::string p;
+                for (const int q : g.pred[i]) p += " " + std::to_string(q) + (g_ops[static_cast<std::size_t>(q)].kind == kOpPass ? "p" : "c") + "t" + std::to_string(g_ops[static_cast<std::size_t>(q)].tgt);
+                std::fprintf(stderr, "[hwr-graph] op %zu kind %d t%d preds:%s\n", i, static_cast<int>(g_ops[i].kind), g_ops[i].tgt, p.c_str());
+            }
         // a load whose surface nothing draws into, reads or copies afterwards and that no target holds any more is not done: a target
         // made over current memory and cleared (renamed) right after (the menus: ~50 MB a frame at the screen's resolution)
         std::vector<u8> dead(n, 0);
@@ -2954,12 +3270,19 @@ void schedule() {
         for (u32 k = 0; k < it.n; ++k) {
             const Op &op = g_ops[static_cast<std::size_t>(g_pass_ops[it.first + k])];
             for (u32 d = op.first_draw; d < op.first_draw + op.draw_count; ++d)
-                if (g_draws[d].res) {
-                    const auto f = by_id.find(g_draws[d].res);
-                    if (f != by_id.end()) last[f->second] = std::max(last[f->second], i);
-                }
+                for (const u64 r : {g_draws[d].res, g_draws[d].res2})
+                    if (r) {
+                        const auto f = by_id.find(r);
+                        if (f != by_id.end()) last[f->second] = std::max(last[f->second], i);
+                    }
         }
     }
+    // DATE draws recorded in reverse: their triangles go to the card last shape first
+    for (const DrawRec &r : g_draws)
+        if (r.rev && r.count > 3) {
+            Vtx *v = g_verts.data() + r.first;
+            for (u32 a = 0, b = r.count - 3; a < b; a += 3, b -= 3) std::swap_ranges(v + a, v + a + 3, v + b);
+        }
     if (g_reorder_verts) g_vorder.reserve(g_verts.size());
     for (std::size_t i = 0; i < g_items.size(); ++i) {
         Item &it = g_items[i];
@@ -2980,7 +3303,7 @@ void schedule() {
                 }
                 if (g_final.size() > it.draw_first) {
                     DrawRec &l = g_final.back();
-                    if (!l.k2 && !r.k2 && l.k1 == r.k1 && l.group == r.group && l.blend == r.blend && l.zuse == r.zuse && std::equal(l.sc, l.sc + 4, r.sc) &&
+                    if (!l.k2 && !r.k2 && !l.rev && !r.rev && l.k1 == r.k1 && l.group == r.group && l.dgroup == r.dgroup && l.blend == r.blend && l.zuse == r.zuse && std::equal(l.sc, l.sc + 4, r.sc) &&
                         (g_reorder_verts || l.first + l.count == r.first)) {
                         l.count += r.count;
                         continue;
@@ -3269,8 +3592,9 @@ void encode_pass(WGPUCommandEncoder enc, const Item &it) {
     if (it.draw_n && !no_draw && g_sweep != 1) {
         wgpuRenderPassEncoderSetVertexBuffer(rp, 0, g_vbuf, 0, vsource().size() * sizeof(Vtx));
         wgpuRenderPassEncoderSetBindGroup(rp, 0, g_param_group, 0, nullptr);
+        wgpuRenderPassEncoderSetBindGroup(rp, 2, g_dummy_date_group, 0, nullptr);
         WGPURenderPipeline cur = nullptr;
-        WGPUBindGroup cur_group = nullptr;
+        WGPUBindGroup cur_group = nullptr, cur_dgroup = g_dummy_date_group;
         float cur_blend = -1.0f;
         u32 cur_sc[4] = {~0u, ~0u, ~0u, ~0u};
         const bool pass_depth = it.ds != nullptr;
@@ -3280,6 +3604,11 @@ void encode_pass(WGPUCommandEncoder enc, const Item &it) {
             if (r.group != cur_group) {
                 wgpuRenderPassEncoderSetBindGroup(rp, 1, r.group, 0, nullptr);
                 cur_group = r.group;
+                ++F.groups;
+            }
+            if (r.dgroup && r.dgroup != cur_dgroup) {
+                wgpuRenderPassEncoderSetBindGroup(rp, 2, r.dgroup, 0, nullptr);
+                cur_dgroup = r.dgroup;
                 ++F.groups;
             }
             if (!std::equal(r.sc, r.sc + 4, cur_sc)) {
@@ -3505,6 +3834,9 @@ void submitted() {
     g_next_item = 0;
     g_open_pass = -1;
     g_clear.on = false;
+    g_date_open_tris.clear();
+    g_date_open_draw = ~std::size_t{0};
+    g_date_open_target = -1;
     ++g_submit;
     g_dec_used = 0;
     for (WGPUBindGroup g : g_release_group) wgpuBindGroupRelease(g);
