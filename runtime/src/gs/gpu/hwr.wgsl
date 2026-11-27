@@ -164,8 +164,13 @@ fn view4_at(d: D, x: u32, y: u32, tbp: u32, tbw: u32, mem: bool) -> vec4<f32> {
 @group(1) @binding(4) var tex_clamp: texture_2d<f32>;
 @group(1) @binding(5) var tex_repeat: texture_2d<f32>;
 
+// DATE (destination alpha test): a copy of the target being drawn, as it was before the draw (hwr.cpp shape(): self_copy, alpha only); the
+// pixel is drawn only where its alpha's top bit equals DATM (flags F_DATM). Group 2 is bound in every pass (a 1x1 texture when no draw needs it).
+@group(2) @binding(0) var dst_copy: texture_2d<f32>;
+
 override TEX: u32 = 0u;
 override ATEST: u32 = 0u;
+override DATE: u32 = 0u;
 
 const F_TME: u32 = 1u;
 const F_FGE: u32 = 2u;
@@ -183,6 +188,7 @@ const F_PREMUL_CEIL: u32 = 2048u;   // Cd - Cs * FIX: the GS's (-Cs * FIX) >> 7 
 // stores (exact where the card only adds or takes the value away; blends with other factors keep 8 bits and are cut where read)
 const F_Q16_FLOOR: u32 = 4096u;
 const F_Q16_CEIL: u32 = 8192u;
+const F_DATM: u32 = 16384u;         // DATE: the pixels drawn are those whose destination alpha has the top bit set (else: clear)
 
 struct VIn {
     @location(0) pos: vec2<f32>,
@@ -510,6 +516,13 @@ fn shade(in: VOut) -> Shaded {
     let d = D(in.da, in.db, in.dc, in.dd);
     let flags = d.a.x;
     let modes = d.a.y;
+    if (DATE != 0u) {
+        // the copy has the target's card size: the same texel as the one drawn (16-bit targets keep alpha 0 or 255)
+        let da = textureLoad(dst_copy, vec2<i32>(floor(in.pos.xy)), 0).w;
+        if ((da >= 0.5) != ((flags & F_DATM) != 0u)) {
+            discard;
+        }
+    }
     let cf = floor(in.col * 255.0 + vec4<f32>(0.002));
     var r = i32(cf.x);
     var g = i32(cf.y);

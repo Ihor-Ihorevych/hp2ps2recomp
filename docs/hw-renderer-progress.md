@@ -276,3 +276,25 @@ frame (`g_ring_submits`, reset in flush); later uploads take the per-submit buff
 Also: hwr texture cache entries unused for 50 frames are recycled by size (texture, view and groups kept) instead of making a texture per
 movie picture. Debug: `[gpu] submits by site` at exit.
 App version 1.1 (AndroidManifest versionName, versionCode 2), shown under the title in the settings.
+
+## M6 (Harry Potter 2, weak tile GPU): DATE (2026-11-27)
+
+* **Destination alpha test** (was "FALLBACK DATE": ~2 600 shapes a frame of the heads scene not drawn). A DATE draw reads a copy of its
+  own target (the self-copy mechanism, alpha only) bound as group 2 (hwr.wgsl `dst_copy`, override `DATE`, flag F_DATM) and discards
+  where the copy's alpha top bit differs from DATM. Every pipeline layout has group 2 (a 1x1 texture is bound when no draw needs it).
+* HP2's DATE shapes: projected character shadows (texture: the 128x... shadow target at 0x3B80, CT32) drawn into the 704x576 CT16S buffer
+  at 0x2F20, DATM 0, no blending, no depth write, alpha written: the first shape that reaches a pixel sets its A bit and blocks the
+  shapes after it. With a copy per shape that is ~1 550 copies and render passes a frame. Instead such draws (DATE, alpha written, no
+  blend, no depth write, one draw) are sent to the card in reverse order (`DrawRec::rev`, reversed in schedule()): the first shape is
+  drawn last and wins its pixels, and all shapes of the run read one copy. Assumption: the alpha written fails DATM (exact for these
+  shadows). Other DATE draws keep their written triangles (`Target::date_tris`); a DATE shape that overlaps none of them (separating-axis
+  test) reads the same copy. A copy made for a DATE draw also takes the whole written rectangles it meets, so they are clean afterwards.
+* Check: the 0x2F20 buffer after frame 5700 (PS2_VRAM_DUMP) is identical with the reversed draws and with a copy per shape
+  (PS2_HWR_DATE_REVERSE=0 PS2_HWR_DATE_TRIS=0). The presented frames 5600/5700/5800 are bit-identical with and without DATE: in this
+  scene the composite of 0x2F20 into the frame does not show the shadow pixels (5 840 pixels of 0x2F20 differ). The exact renderer's
+  0x2F20 has none of these shadow pixels at frame 5700 (its 0x3B80 shadow target has 3 860 fewer pixels with alpha 0x80 than hw's): an
+  upstream difference of the shadow target, not of DATE.
+* Cost (heads scene, per drawn frame): render passes 43 -> 62.6, attachment loads 27.6 -> 59.7 MB, stores 26.6 -> 58.7 MB, self copies
+  17 -> 31.6 (each character's shadow run is a 0x2F20 pass with the frame's depth, between the passes of its shadow target).
+* Switches: `PS2_HWR_DATE=0` (DATE shapes not drawn, as before), `PS2_HWR_DATE_REVERSE=0` (no reversed draws), `PS2_HWR_DATE_TRIS=0`
+  (any DATE alpha write under a shape's rectangle makes a new copy).
