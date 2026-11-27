@@ -2468,26 +2468,35 @@ bool batch_on() {
 }
 
 namespace {
-// A corner of a run converted once (a strip's corner belongs to up to three triangles): its position in GS pixels and its card vertex with
-// its own colour (a flat-shaded triangle takes the colour of its last corner: shape()'s `iip ? v[i] : v[2]`).
+// A corner of a run converted once (a strip's corner belongs to up to three triangles): its position relative to the offset in GS
+// sub-pixels (dx, dy: x - XYOFFSET, 1/16 pixel), in GS pixels (x, y) and its card vertex with its own colour (a flat-shaded triangle takes
+// the colour of its last corner: shape()'s `iip ? v[i] : v[2]`).
 struct Corner {
+    int dx, dy;
     float x, y;
     Vtx o;
 };
 std::vector<Corner> g_corners;
-std::vector<u32> g_corner_mark;  // == g_corner_pass: converted in this triangle_run
+std::vector<u32> g_corner_mark;  // == g_corner_pass: converted in this prim_run
 u32 g_corner_pass = 0;
 
-// Triangles of one run (shapes()) while the draw state stays what it is: what shape() does for each, in the same order and with the same
-// results, without what cannot change between them. Ends after the triangle that changed the epoch (a page taken from another owner, a
-// target grown): the next one's state is worked out again, as shape() would. Triangle k has the corners v[idx[3k..3k+2]] (idx null: v[3k..]).
-// Returns how many triangles it took.
-int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u32 mip_top, const Vertex *v, int nverts, const u16 *idx, int prims) {
+// ceil(d / 16) for a position in 1/16 pixels: the same as shape()'s std::ceil((float(x) - ofx) / 16.0f), which is exact in float (both
+// below 2^16), without the float rounding call (a library call on x86 without SSE4.1)
+inline int ceil16(int d) { return (d + 15) >> 4; }
+
+// Primitives of one run (shapes()) while the draw state stays what it is: what shape() does for each, in the same order and with the same
+// results, without what cannot change between them. Ends after the primitive that changed the epoch (a page taken from another owner, a
+// target grown): the next one's state is worked out again, as shape() would. Primitive k has the corners v[idx[per*k + j]] (idx null:
+// v[per*k + j]); per 3: triangles, per 2: sprites (only states that are no clear or cover run: shapes() checks). Returns how many it took.
+int prim_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u32 mip_top, const Vertex *v, int nverts, const u16 *idx, int prims, int per) {
     const u64 epoch = g_epoch;
+    const bool sprite = per == 2;
+    const u32 nv = sprite ? 6u : 3u;
     u64 attr = st.prim;
     if (!(st.prmodecont & 1u)) attr = (st.prim & 7u) | (st.prmode & ~7ull);
     const ps2::gs::Context &gc = st.ctx[(attr >> 9) & 1u];
-    const float ofx = static_cast<float>(gc.xyoffset & 0xFFFFu), ofy = static_cast<float>((gc.xyoffset >> 32) & 0xFFFFu);
+    const int iofx = static_cast<int>(gc.xyoffset & 0xFFFFu), iofy = static_cast<int>((gc.xyoffset >> 32) & 0xFFFFu);
+    const float ofx = static_cast<float>(iofx), ofy = static_cast<float>(iofy);
     Target &ct = *g_targets[static_cast<std::size_t>(s.color)];
     const int W = static_cast<int>(ct.w);
     int H = static_cast<int>(ct.h);
@@ -2499,19 +2508,21 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
     float sxs = 2.0f / static_cast<float>(W), sys = 2.0f / static_cast<float>(H);
     const u32 zmax = s.zmax, param = s.param;
     const double zscale = s.zscale;
-    // the pages already taken in this run (page columns and rows, inclusive): a triangle inside them changes no owner (and counts as a write
-    // to them already: g_page_write is only compared with what the last write-back saw). Page sizes are powers of two.
+    // the pages already taken in this run (page columns and rows, inclusive): a primitive inside them changes no owner (and counts as a
+    // write to them already: g_page_write is only compared with what the last write-back saw). Page sizes are powers of two.
     u32 cpw, cph, dpw = 1, dph = 1;
     page_dims(ct.psm, cpw, cph);
     if (dt) page_dims(dt->psm, dpw, dph);
     const int csx = __builtin_ctz(cpw), csy = __builtin_ctz(cph), dsx = __builtin_ctz(dpw), dsy = __builtin_ctz(dph);
     int cpr[4] = {1, 1, 0, 0}, dpr[4] = {1, 1, 0, 0};  // empty
-    DrawRec *cur = nullptr;  // the draw this run's triangles go into, once known
-    // corners converted on first use; the conversion depends on the state (scale, depth range, record), so once per call
-    if (g_corners.size() < static_cast<std::size_t>(nverts)) g_corners.resize(static_cast<std::size_t>(nverts)), g_corner_mark.resize(static_cast<std::size_t>(nverts), 0u);
-    if (++g_corner_pass == 0) {
-        std::fill(g_corner_mark.begin(), g_corner_mark.end(), 0u);
-        g_corner_pass = 1;
+    DrawRec *cur = nullptr;  // the draw this run's primitives go into, once known
+    // triangle corners converted on first use; the conversion depends on the state (scale, depth range, record), so once per call
+    if (!sprite) {
+        if (g_corners.size() < static_cast<std::size_t>(nverts)) g_corners.resize(static_cast<std::size_t>(nverts)), g_corner_mark.resize(static_cast<std::size_t>(nverts), 0u);
+        if (++g_corner_pass == 0) {
+            std::fill(g_corner_mark.begin(), g_corner_mark.end(), 0u);
+            g_corner_pass = 1;
+        }
     }
     u32 pass_id = g_corner_pass;
     Corner *corners = g_corners.data();
@@ -2521,6 +2532,8 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
         if (mark[i] != pass_id) {
             mark[i] = pass_id;
             const Vertex &p = v[i];
+            c.dx = static_cast<int>(p.x) - iofx;
+            c.dy = static_cast<int>(p.y) - iofy;
             c.x = (static_cast<float>(p.x) - ofx) / 16.0f;
             c.y = (static_cast<float>(p.y) - ofy) / 16.0f;
             put_vtx(c.o, c.x, c.y, p, p, p.z, p.f, p.q, sxs, sys, zmax, zscale, fst, param);
@@ -2528,20 +2541,30 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
         return c;
     };
     const u32 first_all = static_cast<u32>(g_verts.size());
-    g_verts.resize(first_all + static_cast<std::size_t>(prims) * 3u);  // written in place; cut to what was drawn at the end
+    g_verts.resize(first_all + static_cast<std::size_t>(prims) * nv);  // written in place; cut to what was drawn at the end
     u32 used = first_all;
     int k = 0;
     while (k < prims) {
         u32 ci[3];
-        if (idx) ci[0] = idx[3 * k], ci[1] = idx[3 * k + 1], ci[2] = idx[3 * k + 2];
-        else ci[0] = static_cast<u32>(3 * k), ci[1] = ci[0] + 1, ci[2] = ci[0] + 2;
+        if (idx) {
+            for (int j = 0; j < per; ++j) ci[j] = idx[per * k + j];
+        } else {
+            for (int j = 0; j < per; ++j) ci[j] = static_cast<u32>(per * k + j);
+        }
         ++k;
         ++F.shapes;
-        const Corner *c[3] = {&corner(ci[0]), &corner(ci[1]), &corner(ci[2])};
-        const float minx = std::min({c[0]->x, c[1]->x, c[2]->x}), maxx = std::max({c[0]->x, c[1]->x, c[2]->x});
-        const float miny = std::min({c[0]->y, c[1]->y, c[2]->y}), maxy = std::max({c[0]->y, c[1]->y, c[2]->y});
-        int x0 = std::max(s.sc[0], static_cast<int>(std::ceil(minx))), x1 = std::min(s.sc[2], static_cast<int>(std::ceil(maxx)));
-        int y0 = std::max(s.sc[1], static_cast<int>(std::ceil(miny))), y1 = std::min(s.sc[3], static_cast<int>(std::ceil(maxy)));
+        const Corner *c[3] = {nullptr, nullptr, nullptr};
+        int x0, x1, y0, y1;
+        if (sprite) {  // the box of the two corners, the right and bottom edges not drawn
+            const Vertex &a = v[ci[0]], &b = v[ci[1]];
+            const int ax = static_cast<int>(a.x) - iofx, ay = static_cast<int>(a.y) - iofy, bx = static_cast<int>(b.x) - iofx, by = static_cast<int>(b.y) - iofy;
+            x0 = std::max(s.sc[0], ceil16(std::min(ax, bx))), x1 = std::min(s.sc[2], ceil16(std::max(ax, bx)) - 1);
+            y0 = std::max(s.sc[1], ceil16(std::min(ay, by))), y1 = std::min(s.sc[3], ceil16(std::max(ay, by)) - 1);
+        } else {
+            c[0] = &corner(ci[0]), c[1] = &corner(ci[1]), c[2] = &corner(ci[2]);
+            x0 = std::max(s.sc[0], ceil16(std::min({c[0]->dx, c[1]->dx, c[2]->dx}))), x1 = std::min(s.sc[2], ceil16(std::max({c[0]->dx, c[1]->dx, c[2]->dx})));
+            y0 = std::max(s.sc[1], ceil16(std::min({c[0]->dy, c[1]->dy, c[2]->dy}))), y1 = std::min(s.sc[3], ceil16(std::max({c[0]->dy, c[1]->dy, c[2]->dy})));
+        }
         x0 = std::max(x0, 0), y0 = std::max(y0, 0);
         if (x1 < x0 || y1 < y0) {
             ++F.skipped;
@@ -2553,15 +2576,17 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
             if (s.needs_depth) grow(s.depth, rows);
             H = static_cast<int>(ct.h);
             cur = nullptr;  // another surface: the pass and the scissor are found again
-            // the card's y of every corner depends on the height: convert again (from this triangle on, as shape() would)
+            // the card's y of every corner depends on the height: convert again (from this primitive on, as shape() would)
             if (2.0f / static_cast<float>(H) != sys) {
                 sys = 2.0f / static_cast<float>(H);
-                if (++g_corner_pass == 0) {
-                    std::fill(g_corner_mark.begin(), g_corner_mark.end(), 0u);
-                    g_corner_pass = 1;
+                if (!sprite) {
+                    if (++g_corner_pass == 0) {
+                        std::fill(g_corner_mark.begin(), g_corner_mark.end(), 0u);
+                        g_corner_pass = 1;
+                    }
+                    pass_id = g_corner_pass;
+                    for (int i = 0; i < 3; ++i) c[i] = &corner(ci[i]);
                 }
-                pass_id = g_corner_pass;
-                for (int i = 0; i < 3; ++i) c[i] = &corner(ci[i]);
             }
         }
         if (x1 >= W || y1 >= H) {
@@ -2572,14 +2597,14 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
                 continue;
             }
         }
-        g_clear.on = false;  // a triangle ends a run of clear strips (shape(): not the same kind)
+        g_clear.on = false;  // ends a run of clear strips (shape(): not the same kind; shapes() sends no clear or cover sprites here)
         if (g_log && s.src.kind == 1 && mip_top && mip[0]) {
             const u32 m = mip[0];
             const float kk = static_cast<float>(static_cast<int32_t>(((m >> 16) & 0xFFFu) << 20) >> 20) / 16.0f;
             float lod_max = kk;
             if (!(m & 1u) && !(w[0] & 16u)) {
                 float qmin = 1e30f;
-                for (int i = 0; i < 3; ++i) qmin = std::min(qmin, std::fabs(v[ci[i]].q));
+                for (int i = 0; i < per; ++i) qmin = std::min(qmin, std::fabs(v[ci[i]].q));
                 lod_max = qmin > 0.0f ? std::log2(1.0f / qmin) * static_cast<float>(1u << ((m >> 8) & 3u)) + kk : 1e9f;
             }
             const u32 need = lod_max <= -0.01f ? 1u : std::min<u32>(mip_top + 1u, static_cast<u32>(std::floor(lod_max)) + 2u);
@@ -2588,11 +2613,26 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
         }
         const u32 first = used;
         Vtx *out = g_verts.data() + first;
-        out[0] = c[0]->o, out[1] = c[1]->o, out[2] = c[2]->o;
-        if (!iip) out[0].rgba = out[1].rgba = out[2].rgba;
-        used += 3;
+        if (sprite) {  // shape(): two triangles, colour, depth, fog and q from the second corner, s and t (u and v) from the corners they belong to
+            const Vertex &a = v[ci[0]], &b = v[ci[1]];
+            const float px0 = (static_cast<float>(a.x) - ofx) / 16.0f, py0 = (static_cast<float>(a.y) - ofy) / 16.0f;
+            const float px1 = (static_cast<float>(b.x) - ofx) / 16.0f, py1 = (static_cast<float>(b.y) - ofy) / 16.0f;
+            Vertex ab = a, ba = b;
+            ab.s = b.s, ab.u = b.u;
+            ba.s = a.s, ba.u = a.u;
+            put_vtx(out[0], px0, py0, b, a, b.z, b.f, b.q, sxs, sys, zmax, zscale, fst, param);
+            put_vtx(out[1], px1, py0, b, ab, b.z, b.f, b.q, sxs, sys, zmax, zscale, fst, param);
+            put_vtx(out[2], px0, py1, b, ba, b.z, b.f, b.q, sxs, sys, zmax, zscale, fst, param);
+            out[3] = out[1];
+            put_vtx(out[4], px1, py1, b, b, b.z, b.f, b.q, sxs, sys, zmax, zscale, fst, param);
+            out[5] = out[2];
+        } else {
+            out[0] = c[0]->o, out[1] = c[1]->o, out[2] = c[2]->o;
+            if (!iip) out[0].rgba = out[1].rgba = out[2].rgba;
+        }
+        used += nv;
         if (cur) {
-            cur->count += 3;
+            cur->count += nv;
         } else {
             ensure_pass(s);
             Op &pass = g_ops[static_cast<std::size_t>(g_open_pass)];
@@ -2605,7 +2645,7 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
                 DrawRec &last = g_draws.back();
                 if (last.k1 == s.kp1 && last.k2 == s.kp2 && last.group == group && last.blend == s.blend && last.zuse == s.needs_depth && std::equal(sc, sc + 4, last.sc) &&
                     last.first + last.count == first) {
-                    last.count += 3;
+                    last.count += nv;
                     merged = true;
                 }
             }
@@ -2614,7 +2654,7 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
                 DrawRec r;
                 r.k1 = s.kp1, r.k2 = s.kp2, r.group = group, r.blend = s.blend;
                 std::copy(sc, sc + 4, r.sc);
-                r.first = first, r.count = 3;
+                r.first = first, r.count = nv;
                 r.res = res;
                 r.zuse = s.needs_depth;
                 r.zread = s.zread;
@@ -2633,7 +2673,8 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
                 });
                 cpr[0] = a, cpr[1] = b, cpr[2] = cc, cpr[3] = d;
             }
-            note_write(ct, x0, y0, x1, y1, s.awrite_any);
+            ++ct.writes;
+            if (ct.snap) note_write(ct, x0, y0, x1, y1, s.awrite_any), --ct.writes;
         }
         if (s.zwrite_any && dt) {
             dt->valid_w = std::max(dt->valid_w, x1 + 1), dt->valid_h = std::max(dt->valid_h, y1 + 1);
@@ -2647,8 +2688,8 @@ int triangle_run(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
             }
         }
         ++F.drawn;
-        F.vertices += 3;
-        if (g_epoch != epoch) break;  // the next triangle's state is worked out again (shape(): prepare_state)
+        F.vertices += nv;
+        if (g_epoch != epoch) break;  // the next primitive's state is worked out again (shape(): prepare_state)
     }
     g_verts.resize(used);
     return k;
@@ -2666,7 +2707,9 @@ void shapes(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seri
         for (int j = 0; j < per; ++j) c[j] = v[idx[i * per + j]];
         shape(st, w, mip, mip_top, serial, c, per);
     };
-    if (!batch_on() || per != 3 || prim < 3 || prim > 5 || g_dump_now || prov::g_on || page_log() >= 0 || skip_tbp_value() >= 0) {
+    const bool kind_ok = (per == 3 && prim >= 3 && prim <= 5) || (per == 2 && prim == 6);
+    if (!batch_on() || !kind_ok || g_dump_now || prov::g_on || page_log() >= 0 || skip_tbp_value() >= 0) {
+        if (drawtime::g_on) drawtime::g_slow[3] += static_cast<u64>(prims);
         for (int i = 0; i < prims; ++i) one(i);
         return;
     }
@@ -2689,15 +2732,26 @@ void shapes(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seri
                 F.skipped += static_cast<u64>(rest);
                 return;
             }
-            const bool fast = s.src.view != 4 && !(s.src.kind && s.src.target >= 0 && s.src.target == s.color) && s.kp2 == 0;
+            bool fast = s.src.view != 4 && !(s.src.kind && s.src.target >= 0 && s.src.target == s.color) && s.kp2 == 0;
+            if (fast && per == 2) {
+                // sprites that could be part of a clear run or a cover run (shape(): clear_part, cover_part) go one by one
+                const Target &ct = *g_targets[static_cast<std::size_t>(s.color)];
+                const Target *dt = s.needs_depth ? g_targets[static_cast<std::size_t>(s.depth)].get() : nullptr;
+                const u32 flags = w[0];
+                const bool clear_part = !(flags & 2u) && !s.k1.blend && !(flags & 4u) && s.k1.atest == 0 && (s.k1.mask == 0 || s.color_full) && (s.k1.mask || s.k1.zwrite) &&
+                                        (!s.k1.zwrite || (s.k1.zcmp == WGPUCompareFunction_Always && dt && dt->w == ct.w && dt->h == ct.h));
+                const bool cover_part = (flags & 2u) && s.src.kind && s.src.target != s.color && !s.k1.blend && s.k1.atest == 0 && s.color_full;
+                fast = !clear_part && !cover_part && !g_stream_order;
+            }
             if (fast) {
-                if (idx) i += triangle_run(s, st, w, mip, mip_top, v, nverts, idx + static_cast<std::size_t>(i) * 3u, rest);
-                else i += triangle_run(s, st, w, mip, mip_top, v + static_cast<std::size_t>(i) * 3u, rest * 3, nullptr, rest);
+                if (idx) i += prim_run(s, st, w, mip, mip_top, v, nverts, idx + static_cast<std::size_t>(i) * static_cast<std::size_t>(per), rest, per);
+                else i += prim_run(s, st, w, mip, mip_top, v + static_cast<std::size_t>(i) * static_cast<std::size_t>(per), rest * per, nullptr, rest, per);
                 if (g_log) F.cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 continue;
             }
         }
-        // a draw that reads its own target, reads through memory addresses (view 4) or is drawn twice (alpha test): shape() by shape
+        // a draw that reads its own target, reads through memory addresses (view 4), is drawn twice (alpha test) or may clear: shape() by shape
+        if (drawtime::g_on) ++drawtime::g_slow[s.kp2 ? 0 : s.src.view == 4 ? 2 : per == 2 ? 3 : 1];
         one(i);
         ++i;
     }
@@ -3726,32 +3780,57 @@ void submitted() {
 void frame_end() {
     if (!g_on) return;
     ++g_frames;
-    if (drawtime::g_on) {  // PS2_DRAW_TIME=1: the drawing thread's GS stream time per picture, every 100 pictures (drawtime.hpp)
+#if defined(_WIN32)
+    if (g_frames == 100) {  // after the start (pipelines, translations)
+        const std::string path = os::env("PS2_DRAW_SAMPLE");
+        if (!path.empty()) drawtime::start_sampler(path.c_str());
+    }
+#endif
+    if (drawtime::g_on) {  // PS2_DRAW_TIME: the drawing thread's GS stream time and its processor time per picture (drawtime.hpp)
+        // Per picture into a bucket (1: the A/B switch had the shortcuts off for it), summed from picture 100 on (the first ones set up and
+        // compile); printed every 100 pictures. With PS2_DRAW_TIME=ab the switch flips every PS2_DRAW_TIME_EVERY pictures (10).
+        static const u64 every = [] {
+            const long n = std::strtol(os::env("PS2_DRAW_TIME_EVERY").c_str(), nullptr, 10);
+            return static_cast<u64>(n > 0 ? n : 10);
+        }();
         static u64 frames = 0, tsc0 = drawtime::now();
         static auto clock0 = std::chrono::steady_clock::now();
-        if (++frames % 100 == 0) {
-            const u64 tsc1 = drawtime::now();
-            const auto clock1 = std::chrono::steady_clock::now();
-            const double ms_per_tick = std::chrono::duration<double, std::milli>(clock1 - clock0).count() / static_cast<double>(tsc1 - tsc0);
-            const auto ms = [&](int part) { return static_cast<double>(drawtime::g_sum[part]) * ms_per_tick / 100.0; };
-            static double thread0 = -1.0;
-            const double thread1 = drawtime::thread_ms(ms_per_tick);
-            if (thread0 >= 0.0) std::fprintf(stderr, "[draw-time] drawing thread processor time %.3f ms per picture\n", (thread1 - thread0) / 100.0);
-            thread0 = thread1;
-            std::fprintf(stderr, "[draw-time] frames %llu-%llu, per picture: gif %.3f ms (%llu messages), shape %.3f ms (%llu calls), build %.3f ms (%llu)\n",
-                         static_cast<unsigned long long>(g_frames - 98), static_cast<unsigned long long>(g_frames + 1), ms(drawtime::kGif),
-                         static_cast<unsigned long long>(drawtime::g_count[drawtime::kGif] / 100), ms(drawtime::kShape),
-                         static_cast<unsigned long long>(drawtime::g_count[drawtime::kShape] / 100), ms(drawtime::kBuild),
-                         static_cast<unsigned long long>(drawtime::g_count[drawtime::kBuild] / 100));
-            std::fprintf(stderr, "[draw-time] runs closed per picture by: register writes %.0f, single PACKED writes %.0f, image data %.0f, other messages %.0f, other PACKED tags %.0f\n",
-                         drawtime::g_close[0] / 100.0, drawtime::g_close[1] / 100.0, drawtime::g_close[2] / 100.0, drawtime::g_close[3] / 100.0, drawtime::g_close[4] / 100.0);
-            for (auto &c : drawtime::g_close) c = 0;
-            if (g_ab_on) {
-                std::fprintf(stderr, "[draw-time] (the 100 pictures above: %s)\n", g_ab_off ? (g_ab_memo_only ? "memo OFF" : "shortcuts OFF") : "shortcuts on");
-                g_ab_off = !g_ab_off;
+        static double thread_last = -1.0, thread_sum[2] = {}, sum[2][drawtime::kParts] = {};
+        static u64 count[2][drawtime::kParts] = {}, pictures[2] = {};
+        const int b = g_ab_off ? 1 : 0;
+        const double thread_now = drawtime::thread_ms(1.0);  // Windows: cycles (converted below), else ms
+        if (thread_last >= 0.0 && frames >= 100) {
+            thread_sum[b] += thread_now - thread_last;
+            for (int k = 0; k < drawtime::kParts; ++k) sum[b][k] += static_cast<double>(drawtime::g_sum[k]), count[b][k] += drawtime::g_count[k];
+            ++pictures[b];
+        }
+        thread_last = thread_now;
+        for (int k = 0; k < drawtime::kParts; ++k) drawtime::g_sum[k] = drawtime::g_count[k] = 0;
+        ++frames;
+        if (g_ab_on && frames % every == 0) g_ab_off = !g_ab_off;
+        if (frames % 100 == 0 && frames > 100) {
+            const double ms_per_tick = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clock0).count() / static_cast<double>(drawtime::now() - tsc0);
+#if defined(_WIN32)
+            const double thread_scale = ms_per_tick;
+#else
+            const double thread_scale = 1.0;
+#endif
+            for (int k = 0; k < 2; ++k) {
+                if (!pictures[k]) continue;
+                const double n = static_cast<double>(pictures[k]);
+                std::fprintf(stderr, "[draw-time] pictures 100-%llu%s (%llu): drawing thread processor %.3f ms per picture | gif %.3f ms (%.0f messages), shape %.3f ms (%.0f calls), build %.3f ms (%.0f), PACKED runs %.3f ms (%.0f)\n",
+                             static_cast<unsigned long long>(frames), g_ab_on ? (k ? (g_ab_memo_only ? ", memo OFF" : ", shortcuts OFF") : ", shortcuts on") : "",
+                             static_cast<unsigned long long>(pictures[k]), thread_sum[k] * thread_scale / n, sum[k][drawtime::kGif] * ms_per_tick / n,
+                             static_cast<double>(count[k][drawtime::kGif]) / n, sum[k][drawtime::kShape] * ms_per_tick / n, static_cast<double>(count[k][drawtime::kShape]) / n,
+                             sum[k][drawtime::kBuild] * ms_per_tick / n, static_cast<double>(count[k][drawtime::kBuild]) / n,
+                             sum[k][drawtime::kPacked] * ms_per_tick / n, static_cast<double>(count[k][drawtime::kPacked]) / n);
             }
-            for (int k = 0; k < drawtime::kParts; ++k) drawtime::g_sum[k] = drawtime::g_count[k] = 0;
-            tsc0 = tsc1, clock0 = clock1;
+            std::fprintf(stderr, "[draw-time] last 100 pictures, per picture: runs closed by register writes %.0f, single PACKED writes %.0f, image data %.0f, other messages %.0f, other PACKED tags %.0f; "
+                                 "primitives one by one: two-pass alpha test %.0f, own target read %.0f, view 4 %.0f, other kinds %.0f\n",
+                         drawtime::g_close[0] / 100.0, drawtime::g_close[1] / 100.0, drawtime::g_close[2] / 100.0, drawtime::g_close[3] / 100.0, drawtime::g_close[4] / 100.0,
+                         drawtime::g_slow[0] / 100.0, drawtime::g_slow[1] / 100.0, drawtime::g_slow[2] / 100.0, drawtime::g_slow[3] / 100.0);
+            for (auto &c : drawtime::g_close) c = 0;
+            for (auto &c : drawtime::g_slow) c = 0;
         }
     }
     timer_read();

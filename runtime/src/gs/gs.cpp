@@ -1159,7 +1159,10 @@ void write_packed_run(const std::uint8_t *data, std::uint32_t count, std::uint64
 #ifdef PS2_GPU
     // hw mode: the primitives of the run go to the renderer together (gpu::draw_run; PS2_HWR_BATCH=0 one by one as before)
     if (!g_gsseq && !trace::g_any && gpu_on() && !cpu_raster() && gpu::batch_wanted()) {
+        const drawtime::Span packed_span(drawtime::kPacked);
         if (!g_run.open) run_begin();
+        // the data was written by the vector-unit thread on another core: ask for its lines at once instead of one miss after another
+        for (std::uint32_t off = 0; off < count * 16u && off < 4096u; off += 64u) __builtin_prefetch(data + off);
         for (std::uint32_t k = 0; k < count; ++k) {
             Reg128 q;
             std::memcpy(&q, data + static_cast<std::size_t>(k) * 16, 16);
