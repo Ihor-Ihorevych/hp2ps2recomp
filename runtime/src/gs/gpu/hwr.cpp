@@ -477,8 +477,11 @@ constexpr u32 kInv32 = 45056, kInv16 = kInv32 + 2048, kInv16S = kInv16 + 4096, k
 WGPUBuffer g_addr = nullptr;
 WGPUBindGroupLayout g_date_layout = nullptr;  // group 2: the destination copy of a DATE draw
 WGPUBindGroup g_dummy_date_group = nullptr;   // group 2 of every other draw
-// PS2_HWR_DATE=0: shapes with the destination alpha test are not drawn (counted as FALLBACK DATE), as before
-const bool g_date_on = os::env("PS2_HWR_DATE") != "0";
+// PS2_HWR_DATE=1: shapes with the destination alpha test are drawn (a copy of the destination, hwr.wgsl DATE). Off by default: on the
+// phone (Mali, targets at 0.89 x 0.83) it turned Harry Potter 2's characters into flat grey shapes and its shadows into grey wedges,
+// while on the PC at 1x the pictures were the same; and in HP2 it showed no difference where it worked. Off: such shapes are not drawn
+// (counted as FALLBACK DATE), as before.
+const bool g_date_on = os::env("PS2_HWR_DATE") == "1";
 WGPUBindGroupLayout g_params_layout = nullptr, g_tex_layout = nullptr, g_store_layout = nullptr, g_load_layout = nullptr, g_depth_layout = nullptr;
 WGPUPipelineLayout g_draw_layout = nullptr;
 WGPUComputePipeline g_load_pipe = nullptr, g_store_pipe = nullptr, g_store_z_pipe = nullptr;
