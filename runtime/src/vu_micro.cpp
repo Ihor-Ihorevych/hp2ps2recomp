@@ -1400,6 +1400,40 @@ void interpret_full(int unit, std::uint32_t pc) {
         spike_chain(pc, spike);
         return;
     }
+    {   // PS2_VU_STAGES=1 (Harry Potter 2's VU1 microcode): a run that starts at the dispatcher (0x0010) reads its header at ITOP+4 and the
+        // table of four stage addresses at qword (header.y + 8); the runs are counted by that table and the header's kick-only word (.w), and
+        // the most frequent are printed every 5 s (stderr): which stages a native dispatcher has to cover first.
+        static const bool stages = std::getenv("PS2_VU_STAGES") != nullptr;
+        if (stages && (pc & 16383u) == 0x10u) {
+            static std::unordered_map<std::uint64_t, std::uint64_t> combos;
+            static std::uint64_t runs = 0;
+            static auto last = std::chrono::steady_clock::now();
+            const std::uint8_t *head = g_vu1_mem + ((g_itop + 4u) & 1023u) * 16u;
+            std::uint32_t hw[4], tw[4];
+            std::memcpy(hw, head, 16);
+            const std::uint8_t *table = g_vu1_mem + (((hw[1] & 0xFFFFu) + 8u) & 1023u) * 16u;
+            std::memcpy(tw, table, 16);
+            const std::uint64_t key = hw[3] & 0xFFFFu ? 0xFFFF000000000000ull | (hw[3] & 0xFFFFu)
+                                                      : (static_cast<std::uint64_t>(tw[0] & 0xFFFFu) << 48) | (static_cast<std::uint64_t>(tw[1] & 0xFFFFu) << 32) |
+                                                            (static_cast<std::uint64_t>(tw[2] & 0xFFFFu) << 16) | (tw[3] & 0xFFFFu);
+            ++combos[key];
+            ++runs;
+            if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
+                last = std::chrono::steady_clock::now();
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> v(combos.begin(), combos.end());
+                std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+                std::fprintf(stderr, "[vu-stages] %llu runs at the dispatcher, %zu stage tables:\n", static_cast<unsigned long long>(runs), v.size());
+                for (std::size_t i = 0; i < v.size() && i < 16; ++i) {
+                    const std::uint64_t k = v[i].first;
+                    if ((k >> 48) == 0xFFFFu)
+                        std::fprintf(stderr, "[vu-stages]   %5.1f %%  kick only (header.w %04X)\n", 100.0 * v[i].second / runs, static_cast<unsigned>(k & 0xFFFFu));
+                    else
+                        std::fprintf(stderr, "[vu-stages]   %5.1f %%  stages %04X %04X %04X %04X\n", 100.0 * v[i].second / runs, static_cast<unsigned>((k >> 48) * 8u),
+                                     static_cast<unsigned>(((k >> 32) & 0xFFFFu) * 8u), static_cast<unsigned>(((k >> 16) & 0xFFFFu) * 8u), static_cast<unsigned>((k & 0xFFFFu) * 8u));
+                }
+            }
+        }
+    }
     g_chaining = true;
     // The plain case (no checking, timing, counting or tracing switch, no JIT) goes straight to the program the entry cache already knows:
     // what run_entry and lookup would do for it, without their set-up. Anything else (a new program, a changed code memory, a program
@@ -1445,6 +1479,24 @@ void interpret_full(int unit, std::uint32_t pc) {
         }
         pc = static_cast<std::uint32_t>(g_chained);
         g_chained = -1;
+        {   // PS2_VU_STAGES=1: every program entry a chain hops to, counted (printed with the stage tables)
+            static const bool stages = std::getenv("PS2_VU_STAGES") != nullptr;
+            if (stages) {
+                static std::unordered_map<std::uint32_t, std::uint64_t> entries;
+                static std::uint64_t total = 0;
+                static auto last = std::chrono::steady_clock::now();
+                ++entries[pc & 16383u];
+                ++total;
+                if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
+                    last = std::chrono::steady_clock::now();
+                    std::vector<std::pair<std::uint32_t, std::uint64_t>> v(entries.begin(), entries.end());
+                    std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+                    std::fprintf(stderr, "[vu-hops] %llu hops:", static_cast<unsigned long long>(total));
+                    for (std::size_t i = 0; i < v.size() && i < 30; ++i) std::fprintf(stderr, " %04X:%.1f%%", v[i].first, 100.0 * v[i].second / total);
+                    std::fprintf(stderr, "\n");
+                }
+            }
+        }
     }
     g_chaining = false;
     kick_flush();  // a program ended with a kick waiting (compiled ones end with theirs; the pair after it may not have been reached)
