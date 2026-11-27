@@ -12,6 +12,7 @@
 
 #ifndef __EMSCRIPTEN__
 
+#include "ps2/governor.hpp"
 #include "ps2/os.hpp"
 #include "ps2/prof.hpp"
 
@@ -29,6 +30,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 extern const char kHwrShader[];
@@ -205,6 +207,7 @@ struct Counters {
     double build_ms = 0;  // their time (PS2_HWR_LOG only)
     u64 nodes = 0, renames = 0, surfaces_made = 0, copy_bytes = 0, overwrites = 0, dead_depth = 0, dead_loads = 0, grown = 0, recycled = 0;
     u64 att_loads = 0, att_stores = 0, att_load_bytes = 0, att_store_bytes = 0;  // render pass attachments that are loaded / stored (tile memory traffic)
+    u64 fs_dropped = 0;   // shapes of skipped frames not drawn (FrameSkip)
     double cpu_ms = 0, sched_ms = 0;
 };
 Counters F, T;  // this frame, the whole run
@@ -254,6 +257,13 @@ struct Target {
                                        // (+1; read as of then for the rest of that frame, as store_for_memory once_per_frame writes a page back)
     u64 writes = 0, stored = ~0ull;  // draws into it so far, and how many of them the last write-back to memory (store_for_memory) had
     int sx0 = 0, sy0 = 0, sx1 = -1, sy1 = -1;  // the rectangle (target pixels) written back at that count
+    // picture skipping (FrameSkip below): the drawn frame it was last drawn in, whether its picture lacks a skipped frame's draws, and
+    // how many presents in a row kept the last picture for it
+    u64 fs_drawn = 0;
+    bool fs_skipped = false;
+    u32 fs_held = 0;
+    bool fs_keep = false;  // the game reads it back (FrameSkip: never dropped); valid while fs_keep_gen is the set's generation
+    u32 fs_keep_gen = 0;
 };
 std::vector<std::unique_ptr<Target>> g_targets;
 std::vector<WGPUTexture> g_release_tex;
@@ -2008,6 +2018,80 @@ bool init(const Context &ctx) {
     return true;
 }
 
+// ---------------------------------------------------------------- picture skipping (the governor, ps2/governor.hpp)
+// The unit is a drawn frame: the shapes between two vertical blanks (Harry Potter 2 draws its picture in one field and none in the next,
+// copying it into the one buffer the display shows). At the first shape of a frame the governor decides whether the frame is skipped (at
+// most every other drawn frame). In a skipped frame a shape is not drawn when its target was drawn in the drawn frame before too: such a
+// target (the scene, its effect buffers, the display buffer) is drawn again every frame, so the next frame makes it anew and only this
+// frame's picture is missing. Targets drawn now and then (a texture the game renders once, a reflection updated every few frames) are
+// drawn as always, and so is everything else in the stream: uploads, palette loads, local copies, write-backs. A dropped shape changes
+// nothing in the renderer's books (page owners, versions): its target simply keeps the picture of the frame before. The present of a
+// buffer that missed a skipped frame's draws keeps the last picture on the screen (hold_picture), so a game that flips between two
+// buffers never shows the older one; a buffer held for more than 8 presents in a row is shown anyway (a game that stopped drawing).
+//
+// The game itself must go exactly the same way, so what it reads back never misses a draw: a target the game downloads (a brightness
+// or visibility probe) is kept (never dropped), and so is every target a kept target is drawn from, learnt as the shapes come (in stream
+// order, one step of the chain per frame). Nothing is skipped in the first kWarm drawn frames after the start or a state load, so the
+// chains are known before the first skip (a chain longer than that, or a first download after the warm-up, could see one skipped frame).
+// The kept set is by address (base, width, format), so it outlives the targets (a state load drops them all).
+struct FrameSkip {
+    static constexpr u64 kWarm = 8;
+    bool on = false;         // this frame is skipped
+    u64 frame = ~0ull;       // the hwr frame (g_frames) the decision is for
+    u64 drawn = 0;           // drawn frames so far (the one being drawn has this number)
+    u64 warm_until = kWarm;  // no skipping up to this drawn frame
+    std::unordered_set<u64> keep;  // targets the game reads back, and their sources
+    u32 keep_gen = 1;
+    u64 pictures = 0, skipped = 0, held = 0, shown_anyway = 0;
+};
+FrameSkip g_fs;
+
+inline u64 fs_key(const Target &t) { return static_cast<u64>(t.bp) | static_cast<u64>(t.bw) << 16 | static_cast<u64>(t.psm) << 24 | static_cast<u64>(t.depth) << 32; }
+
+bool fs_kept(Target &t) {
+    if (t.fs_keep_gen != g_fs.keep_gen) t.fs_keep_gen = g_fs.keep_gen, t.fs_keep = g_fs.keep.count(fs_key(t)) != 0;
+    return t.fs_keep;
+}
+
+void fs_keep(Target &t, const char *why) {
+    if (!g_fs.keep.insert(fs_key(t)).second) return;
+    ++g_fs.keep_gen;
+    if (governor::mode() != governor::kOff)
+        std::fprintf(stderr, "[frameskip] frame %llu: target %04X/%u psm %02X is never skipped (%s)\n", static_cast<unsigned long long>(g_frames), t.bp, t.bw, t.psm, why);
+}
+
+// true: this shape is not drawn (a skipped frame, a target drawn every frame)
+inline bool fs_drop(const DrawState &s, const u32 *w) {
+    if (g_fs.frame != g_frames) {  // the first shape of this frame: a new drawn frame
+        g_fs.frame = g_frames;
+        ++g_fs.drawn;
+        g_fs.on = g_fs.drawn > g_fs.warm_until && governor::skip_picture();
+        governor::picture_done(g_fs.on);
+        ++g_fs.pictures;
+        if (g_fs.on) ++g_fs.skipped;
+    }
+    Target &t = *g_targets[static_cast<std::size_t>(s.color)];
+    if (!g_fs.keep.empty() && (fs_kept(t) || (s.needs_depth && s.depth >= 0 && fs_kept(*g_targets[static_cast<std::size_t>(s.depth)])))) {
+        // a target the game reads back (or its depth): drawn, and so are the targets it is drawn from
+        if (w[0] & 2u) {
+            const int so = g_owner[(w[12] / 32) & (kPages - 1)];
+            if (so >= 0 && so != s.color) fs_keep(*g_targets[static_cast<std::size_t>(so)], "a target the game reads back is drawn from it");
+        }
+        t.fs_drawn = g_fs.drawn;
+        return false;
+    }
+    const bool every_frame = t.fs_drawn && t.fs_drawn + 1 >= g_fs.drawn;  // drawn in the drawn frame before (or already in this one)
+    t.fs_drawn = g_fs.drawn;
+    if (!g_fs.on || !every_frame) {
+        if (t.fs_skipped) t.fs_skipped = false, t.fs_held = 0;  // drawn again: its picture is current from here on
+        return false;
+    }
+    t.fs_skipped = true;
+    g_clear.on = false;  // a clear run in the making does not go on over a dropped shape
+    ++F.fs_dropped;
+    return true;
+}
+
 void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 serial, const Vertex *v, int count) {
     const auto t0 = g_log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};  // timed for PS2_HWR_LOG only: two clock reads per shape cost ~1 ms per frame on a phone
     const prof::Scope shape_scope(prof::kRShape);
@@ -2028,6 +2112,10 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
         s.param = shape_params(s, mip, mip_top);
         s.sc[0] = static_cast<int>(w[10] & 0xFFFFu), s.sc[2] = static_cast<int>(w[10] >> 16);
         s.sc[1] = static_cast<int>(w[11] & 0xFFFFu), s.sc[3] = static_cast<int>(w[11] >> 16);
+    }
+    if (s.skip == 0 && s.color >= 0 && governor::mode() != governor::kOff && fs_drop(s, w)) {
+        if (g_log) F.cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return;
     }
     // A view-4 draw reads every texel from one target (the owner of the texture's first page). The texels this draw reads must all lie in
     // pages that target holds; otherwise (Harry Potter 2's sun haze: a 1408-wide T8 view over a 704-wide 16-bit buffer, whose further
@@ -2519,6 +2607,31 @@ void show(WGPUTexture dst) {
     close_pass();
 }
 
+void game_read(u32 offset, u32 bytes) {
+    if (!g_on || !bytes) return;
+    for (u32 page = offset / 8192; page <= (offset + bytes - 1) / 8192; ++page) {
+        const int o = g_owner[page & (kPages - 1)];
+        if (o >= 0) fs_keep(*g_targets[static_cast<std::size_t>(o)], "the game reads it back");
+    }
+}
+
+bool hold_picture(u32 fbp, u32 fbw, u32 psm, u32 x, u32 y) {
+    if (!g_on) return false;
+    u32 f[5];
+    C.fmt_words(psm, fbp, fbw, f);
+    const int owner = g_owner[(block_at(f, x, y) / 32) & (kPages - 1)];
+    if (owner < 0) return false;
+    Target &t = *g_targets[static_cast<std::size_t>(owner)];
+    if (!t.fs_skipped || t.depth || t.bp != fbp || t.bw != fbw) return false;
+    if (++t.fs_held > 8) {  // the game stopped drawing into it: show what it holds
+        t.fs_skipped = false, t.fs_held = 0;
+        ++g_fs.shown_anyway;
+        return false;
+    }
+    ++g_fs.held;
+    return true;
+}
+
 void sync_all() {
     if (!g_on) return;
     g_clear.on = false;
@@ -2555,6 +2668,7 @@ void state_loaded() {
     const u64 gen = ++g_fresh;
     for (u32 b = 0; b < kBlocks; ++b) g_block[b] = mix(mix(0x57A7Eull, gen), b);
     g_clut_id = mix(0xC1A7ull, gen);
+    g_fs.warm_until = g_fs.drawn + FrameSkip::kWarm;
     ++g_epoch;
     close_pass();
 }
@@ -3438,6 +3552,7 @@ void frame_end() {
         g_mem_read_hits = g_mem_read_changes = 0;
         std::fprintf(stderr, " | states built %llu (%.2f ms, %llu for the epoch)", static_cast<unsigned long long>(F.builds), F.build_ms,
                      static_cast<unsigned long long>(F.builds_epoch));
+        if (F.fs_dropped) std::fprintf(stderr, " | skipped frame: %llu shapes not drawn", static_cast<unsigned long long>(F.fs_dropped));
         std::fprintf(stderr, "\n");
     }
     T.shapes += F.shapes, T.drawn += F.drawn, T.skipped += F.skipped, T.clears += F.clears, T.draws += F.draws, T.passes += F.passes, T.pipelines += F.pipelines;
@@ -3445,6 +3560,7 @@ void frame_end() {
     T.target_reads += F.target_reads, T.self_copies += F.self_copies, T.loads += F.loads, T.stores += F.stores, T.targets_made += F.targets_made, T.cpu_ms += F.cpu_ms;
     T.nodes += F.nodes, T.renames += F.renames, T.surfaces_made += F.surfaces_made, T.copy_bytes += F.copy_bytes, T.sched_ms += F.sched_ms;
     T.att_loads += F.att_loads, T.att_stores += F.att_stores, T.att_load_bytes += F.att_load_bytes, T.att_store_bytes += F.att_store_bytes;
+    T.fs_dropped += F.fs_dropped;
     for (int r = 0; r < kReasons; ++r) T.fallback[r] += F.fallback[r];
     for (int r = 0; r < kApproxes; ++r) T.approx[r] += F.approx[r];
     F = Counters{};
@@ -3470,6 +3586,10 @@ void stats() {
         if (T.fallback[r]) std::fprintf(stderr, "[hwr]   fallback %s: %llu shapes\n", kReasonName[r], static_cast<unsigned long long>(T.fallback[r]));
     for (int r = 0; r < kApproxes; ++r)
         if (T.approx[r]) std::fprintf(stderr, "[hwr]   approximation %s: %llu\n", kApproxName[r], static_cast<unsigned long long>(T.approx[r]));
+    if (g_fs.pictures)
+        std::fprintf(stderr, "[frameskip] %llu drawn frames, %llu skipped (%llu shapes not drawn), %llu presents kept the last picture, %llu held pictures shown anyway\n",
+                     static_cast<unsigned long long>(g_fs.pictures), static_cast<unsigned long long>(g_fs.skipped), static_cast<unsigned long long>(T.fs_dropped),
+                     static_cast<unsigned long long>(g_fs.held), static_cast<unsigned long long>(g_fs.shown_anyway));
 }
 
 }  // namespace ps2::gs::gpu::hwr
@@ -3489,6 +3609,8 @@ void clut(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, bool, std:
 void pre_blocks(bool, const std::uint32_t *, std::vector<std::uint32_t> &) {}
 void local_copy(std::uint32_t, std::uint32_t, std::uint32_t, int, int, int, int) {}
 void before_display(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {}
+bool hold_picture(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) { return false; }
+void game_read(std::uint32_t, std::uint32_t) {}
 void sync_all() {}
 void state_loaded() {}
 bool pending() { return false; }

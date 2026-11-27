@@ -68,6 +68,11 @@ void before_display(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std
 // the copy of that picture into `dst` (at 0, 0), after the draws that made it. PS2_HWR_PRESENT=memory turns it off (display_target false).
 bool display_target(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h, std::uint32_t &card_w, std::uint32_t &card_h);
 void show(WGPUTexture dst);
+// Every present asks first: true when that buffer missed the draws of a frame the governor skipped (ps2/governor.hpp, hwr.cpp FrameSkip):
+// nothing new is shown, the screen keeps the last picture.
+bool hold_picture(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t x, std::uint32_t y);
+// the game downloads these bytes of graphics memory: the targets that hold them are never skipped (FrameSkip)
+void game_read(std::uint32_t offset, std::uint32_t bytes);
 // all targets go back to graphics memory (save states, downloads)
 void sync_all();
 // graphics memory was replaced (state load): every target and the identities are dropped

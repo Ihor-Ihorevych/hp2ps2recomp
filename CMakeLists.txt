@@ -79,6 +79,7 @@ else()
         runtime/src/memory.cpp
         runtime/src/os.cpp
         runtime/src/prof.cpp
+        runtime/src/governor.cpp
         runtime/src/prov.cpp
         runtime/src/dispatch.cpp
         runtime/src/system.cpp
@@ -189,6 +190,9 @@ if(NOT EMSCRIPTEN)
     # the picture pace's hold (runtime/include/ps2/pace.hpp) with made-up games, no game and no runtime needed: ninja ps2pacetest
     add_executable(ps2pacetest EXCLUDE_FROM_ALL tests/pace.cpp)
     target_include_directories(ps2pacetest PRIVATE runtime/include)
+    # the governor's rules (runtime/include/ps2/governor.hpp: when the game is behind, which pictures are skipped, the phone's heat): ninja ps2governortest
+    add_executable(ps2governortest EXCLUDE_FROM_ALL tests/governor.cpp)
+    target_include_directories(ps2governortest PRIVATE runtime/include)
     # the lines of the picture each video mode shows (480p must not be cut like a TV picture): ninja ps2displaylinestest
     add_executable(ps2displaylinestest EXCLUDE_FROM_ALL tests/display_lines.cpp)
     target_include_directories(ps2displaylinestest PRIVATE runtime/src)

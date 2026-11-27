@@ -6092,6 +6092,10 @@ void flush() {
         if (std::FILE *f = os::open(vram_dump.substr(vram_dump.find(',') + 1).c_str(), "wb")) {
             std::fwrite(memory.data(), 1, memory.size(), f);
             std::fclose(f);
+            const DisplayRegs r = display_regs();  // what the display shows (to cut its picture out of the dump)
+            std::fprintf(stderr, "[vram-dump] frame %llu: pmode %llX dispfb1 %llX dispfb2 %llX display1 %llX display2 %llX\n", static_cast<unsigned long long>(frame_count()),
+                         static_cast<unsigned long long>(r.pmode), static_cast<unsigned long long>(r.dispfb[0]), static_cast<unsigned long long>(r.dispfb[1]),
+                         static_cast<unsigned long long>(r.display[0]), static_cast<unsigned long long>(r.display[1]));
         }
     }
     wt::frame();
@@ -6156,6 +6160,7 @@ void collect_download() {
 }
 
 bool download_async(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes, std::uint32_t serial) {
+    if (hwr::g_on) hwr::game_read(offset, bytes);
     collect_download();
     if (g_pending.busy) return false;
     if (g_pending.capacity < bytes) {
@@ -6205,6 +6210,7 @@ bool finish_download(std::uint32_t serial) {
 }
 
 void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
+    if (hwr::g_on && !(offset == 0 && bytes >= kMemorySize)) hwr::game_read(offset, bytes);  // (all of memory: a state or a dump, not the game)
     if (hwr::g_on) hwr::sync_all();  // the targets' pictures go to memory first
     flush_all();
     if (g_live) hw::live_position(static_cast<std::uint32_t>(g_commands.size())), hw::live_reader(offset, static_cast<std::uint64_t>(offset) + bytes);
@@ -6935,6 +6941,11 @@ bool present(const DisplaySource &src) {
         g_same.valid = true;
         g_same.skipped_in_row = 0;
         ++g_same.shown;
+    }
+    // a picture the governor skipped (ps2/governor.hpp, hwr.cpp FrameSkip): nothing new to show, the screen keeps the last one
+    if (hwr::g_on && hwr::hold_picture(src.fbp, src.fbw, src.psm, src.dbx, src.dby)) {
+        log.skipped(true);
+        return true;
     }
     log.skipped(false);
     const std::uint32_t current = field_base(g_field), previous = field_base(g_field + 1);
