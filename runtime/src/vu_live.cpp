@@ -13,6 +13,8 @@ bool active() { return false; }
 void unknown(std::uint64_t, std::uint32_t, const std::uint8_t *) {}
 void note_call(std::uint64_t) {}
 std::vector<Program> take() { return {}; }
+std::size_t seed(const std::string &) { return 0; }
+bool settle(void (*)(std::size_t)) { return true; }
 }  // namespace ps2::vu::live
 
 #else
@@ -56,6 +58,7 @@ struct Pending {
     std::uint64_t key = 0;
     std::uint32_t entry = 0;
     std::vector<std::uint8_t> code;
+    bool seeded = false;  // from the seed folder (not written there again)
 };
 
 // ---------------------------------------------------------------------------------------------------------------- state
@@ -72,7 +75,9 @@ struct State {
     bool stopping = false;
     bool worker = false;
     bool busy = false;
+    bool building = false;
     fs::path cache;
+    fs::path seed;  // PS2_VU_SEED: where newly met programs are kept
     fs::path compiler;
     std::uint64_t stamp = 0;
     std::vector<std::string> flags;
@@ -241,6 +246,18 @@ void worker() {
         {
             std::lock_guard lock(g->mutex);
             g->busy = !g->pending.empty();  // more are waiting: the next chunk starts at once
+            g->building = true;
+        }
+        if (!g->seed.empty()) {  // newly met programs into the seed folder, for the next preparation
+            std::error_code error;
+            fs::create_directories(g->seed, error);
+            for (const Pending &p : batch) {
+                if (p.seeded) continue;
+                if (std::FILE *f = std::fopen(ps2::os::utf8(g->seed / (hex(p.key, 16) + "_" + hex(p.entry, 4) + ".bin")).c_str(), "wb")) {
+                    std::fwrite(p.code.data(), 1, p.code.size(), f);
+                    std::fclose(f);
+                }
+            }
         }
         const std::string id = hex(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()), 11);
         Timing timing;
@@ -248,6 +265,7 @@ void worker() {
         const bool ok = build(batch, id, timing, programs);
         {
             std::lock_guard lock(g->mutex);
+            g->building = false;
             if (g->stopping) return;
         }
         if (ok) {
@@ -261,6 +279,10 @@ void worker() {
             return;
         }
     }
+}
+
+bool hex_digits(const std::string &s) {
+    return !s.empty() && std::all_of(s.begin(), s.end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; });
 }
 
 void stop() {
@@ -354,6 +376,60 @@ void unknown(std::uint64_t key, std::uint32_t entry, const std::uint8_t *code) {
     p.code.assign(code, code + kCodeSize);
     g->pending.push_back(std::move(p));
     g->wake.notify_one();
+}
+
+std::size_t seed(const std::string &folder) {
+    if (!g || folder.empty()) return 0;
+    g->seed = ps2::os::path(folder);
+    if (!g->worker) return 0;
+    std::size_t queued = 0;
+    std::error_code error;
+    std::vector<Pending> found;
+    for (const auto &e : fs::directory_iterator(g->seed, error)) {
+        const std::string name = ps2::os::utf8(e.path().filename());
+        // <16 hex digits>_<4 hex digits>.bin
+        if (name.size() != 25 || name[16] != '_' || !name.ends_with(".bin") || !hex_digits(name.substr(0, 16)) || !hex_digits(name.substr(17, 4))) continue;
+        if (e.file_size(error) != kCodeSize) continue;
+        Pending p;
+        p.key = std::strtoull(name.substr(0, 16).c_str(), nullptr, 16);
+        p.entry = static_cast<std::uint32_t>(std::strtoul(name.substr(17, 4).c_str(), nullptr, 16)) & (kCodeSize - 1);
+        p.seeded = true;
+        p.code.resize(kCodeSize);
+        std::FILE *f = std::fopen(ps2::os::utf8(e.path()).c_str(), "rb");
+        if (!f) continue;
+        const bool ok = std::fread(p.code.data(), 1, kCodeSize, f) == kCodeSize;
+        std::fclose(f);
+        if (ok) found.push_back(std::move(p));
+    }
+    std::lock_guard lock(g->mutex);
+    for (Pending &p : found) {
+        if (!g->seen.insert(p.key).second) continue;
+        g->pending.push_back(std::move(p));
+        ++queued;
+    }
+    if (queued) {
+        g->busy = true;  // no quiet-time wait: they are all here
+        g->wake.notify_one();
+    }
+    say("%zu programs of the seed folder %s are not compiled yet: queued", queued, folder.c_str());
+    return queued;
+}
+
+bool settle(void (*progress)(std::size_t left)) {
+    if (!g) return true;
+    std::size_t last = static_cast<std::size_t>(-1);
+    for (;;) {
+        std::size_t left;
+        {
+            std::lock_guard lock(g->mutex);
+            if (!g->worker) return g->pending.empty() && !g->building;
+            left = g->pending.size() + (g->building ? 1 : 0);
+            if (!left) return true;
+        }
+        if (progress && left != last) progress(left);
+        last = left;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
 }
 
 std::vector<Program> take() {

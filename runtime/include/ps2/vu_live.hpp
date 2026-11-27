@@ -27,6 +27,14 @@ bool active();
 // whole 16 KiB of micro memory. Cheap: a program is queued once.
 void unknown(std::uint64_t key, std::uint32_t entry, const std::uint8_t *code);
 
+// PS2_VU_SEED=<folder>: programs met before (files <key>_<entry>.bin, the 16 KiB micro memory, as PS2_VU_RECORD writes them) are
+// queued at the start, so that they are compiled before the game needs them; a program not in the folder that the vector unit meets
+// is added to it. Called after start(); returns how many were queued (those the cache already holds are not).
+std::size_t seed(const std::string &folder);
+
+// Blocks until nothing is queued or being compiled (false: the compiler gave up). `progress` gets a line now and then.
+bool settle(void (*progress)(std::size_t left));
+
 // An interpreted call of a program the build does not know, by key: the busiest programs are built first.
 void note_call(std::uint64_t key);
 

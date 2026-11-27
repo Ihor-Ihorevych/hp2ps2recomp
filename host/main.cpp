@@ -960,6 +960,7 @@ int main(int argc, char **argv) {
             if (cache.empty() && use_self_bundle) cache = ps2::disc::ensure_bundle_live_cache("vu1-live");  // libraries packed with the game
             if (cache.empty()) cache = ps2::os::utf8(data_dir / "vu1-live");
             ps2::vu::live::start(cache);
+            ps2::vu::live::seed(ps2::os::env("PS2_VU_SEED"));  // programs met before: compiled ahead (in --prebuild before it ends)
         }
     }
     register_generated_code();
@@ -1005,7 +1006,11 @@ int main(int argc, char **argv) {
             note("failed: cannot load the program");
             return 1;
         }
-        const bool ok = ps2::ee::live::prebuild(note);
+        bool ok = ps2::ee::live::prebuild(note);
+        // the vector programs of the seed folder (PS2_VU_SEED, queued at the start): wait until they are compiled too
+        static std::function<void(const std::string &)> note_fn;
+        note_fn = note;
+        if (!ps2::vu::live::settle([](std::size_t left) { note_fn("vector programs: " + std::to_string(left) + " left to compile"); })) ok = false;
         note(ok ? "done" : "failed: see the log of the translation");
         return ok ? 0 : 1;
     }
