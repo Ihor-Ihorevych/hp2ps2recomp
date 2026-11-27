@@ -1032,6 +1032,8 @@ int main(int argc, char **argv) {
         ps2::g_options.auto_record = window && !no_record && !replaying && ps2::os::env("PS2_RECORD") != "0";
         if (replaying) {
             if (!ps2::replay_begin()) return 5;
+            // --record with --replay: the same input recorded again with this program's checkpoints (re-recording after a change)
+            if (!ps2::g_options.record_path.empty()) ps2::record_begin_run();
         } else {
             ps2::record_begin_run();
         }

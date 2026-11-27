@@ -369,6 +369,7 @@ struct Replay {
     std::uint64_t checked = 0;
     std::uint64_t last_good = 0;
     std::uint64_t first_bad = 0;  // --replay-continue: the checkpoint where the game first went another way, 0 until then
+    PadSample held[2]{};          // the pad states the replay has given so far (what --record writes again)
     std::uint64_t chain = 0;
     std::map<std::uint64_t, std::vector<std::pair<int, PadSample>>> pads;
     std::map<std::uint64_t, std::uint32_t> checks;
@@ -379,6 +380,32 @@ void replay_end(int status, const std::string &why) {
     g_rep.status = status;
     g_rep.finished = true;
     halt(why);
+}
+
+// the pad states of this frame into the recording: the ports that changed since the last line
+void rec_pads(const PadSample (&pads)[2]) {
+    char line[96];
+    for (int p = 0; p < 2; ++p) {
+        if (!g_rec.first && pads[p] == g_rec.last[p]) continue;
+        g_rec.last[p] = pads[p];
+        const PadSample &s = pads[p];
+        std::snprintf(line, sizeof line, "p%d %llu %04X %u %u %u %u %u %u %d\n", p + 1, static_cast<unsigned long long>(g_frames), s.buttons, s.axes[0], s.axes[1],
+                      s.axes[2], s.axes[3], s.l2, s.r2, s.connected ? 1 : 0);
+        g_rec.buffer += line;
+    }
+    g_rec.first = false;
+}
+
+// the checkpoint of this frame into the recording
+void rec_frame() {
+    g_rec.last_frame = g_frames;
+    g_rec.chain = mix(g_rec.chain, frame_digest());
+    if (g_frames % kCheckEvery == 0) {
+        char line[48];
+        std::snprintf(line, sizeof line, "h %llu %08x\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned>(g_rec.chain ^ (g_rec.chain >> 32)));
+        g_rec.buffer += line;
+    }
+    if (++g_rec.unflushed >= kFlushEvery) rec_flush();
 }
 
 // the pad states of this frame (system.cpp, latch_pads)
@@ -400,21 +427,16 @@ void pads_hook(PadSample (&pads)[2], unsigned &apply) {
             for (const auto &entry : it->second) {
                 pads[entry.first] = entry.second;
                 apply |= 1u << entry.first;
+                g_rep.held[entry.first] = entry.second;
             }
+        // --replay with --record: the same input recorded again, with this program's checkpoints (a new recording after a change
+        // that makes the old one go another way, docs/replay.md)
+        if (g_rec.file) rec_pads(g_rep.held);
         return;
     }
     if (!g_rec.file) return;
     if (g_rec.first) apply = 3;  // the first frame gives the game the whole state, whatever the state it was loaded from held
-    char line[96];
-    for (int p = 0; p < 2; ++p) {
-        if (!g_rec.first && pads[p] == g_rec.last[p]) continue;
-        g_rec.last[p] = pads[p];
-        const PadSample &s = pads[p];
-        std::snprintf(line, sizeof line, "p%d %llu %04X %u %u %u %u %u %u %d\n", p + 1, static_cast<unsigned long long>(g_frames), s.buttons, s.axes[0], s.axes[1],
-                      s.axes[2], s.axes[3], s.l2, s.r2, s.connected ? 1 : 0);
-        g_rec.buffer += line;
-    }
-    g_rec.first = false;
+    rec_pads(pads);
 }
 
 void frame_check() {
@@ -446,17 +468,14 @@ void frame_check() {
                          static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(g_rep.checked));
             replay_end(0, "the replay is over");
         }
+        if (g_rec.file) {
+            rec_frame();
+            if (g_rep.finished) record_stop();
+        }
         return;
     }
     if (!g_rec.file) return;
-    g_rec.last_frame = g_frames;
-    g_rec.chain = mix(g_rec.chain, frame_digest());
-    if (g_frames % kCheckEvery == 0) {
-        char line[48];
-        std::snprintf(line, sizeof line, "h %llu %08x\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned>(g_rec.chain ^ (g_rec.chain >> 32)));
-        g_rec.buffer += line;
-    }
-    if (++g_rec.unflushed >= kFlushEvery) rec_flush();
+    rec_frame();
 }
 
 // run_*.inputs: only the newest few are kept

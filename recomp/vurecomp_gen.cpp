@@ -565,6 +565,54 @@ std::string local_vi(std::string o) {
     return o;
 }
 
+// Unit 1 (M3a, vurecomp 22): the float registers and ACC a program uses are locals of the function (Reg128 vfN, vacc) instead of the
+// register file, so the compiler keeps them in machine registers across a loop instead of storing every result to `r` and reading
+// it back. They are read from the register file at the start (as the shadows are) and the ones the program writes go back at every
+// way out: a hop or the interpreter (vu::interpret), the end of the program (r.tpc), and before the elementary-function unit, which
+// reads its operand from the register file (efu). Exact: the register file holds the same values wherever anything else can see it.
+// PS2_VU_NO_LOCAL_VF=1 at generation time leaves it out.
+std::string local_vf(std::string o) {
+    static const bool off = std::getenv("PS2_VU_NO_LOCAL_VF") != nullptr;
+    if (off) return o;
+    std::string declare, sync;
+    const auto written_at = [&](const std::string &tok) {
+        for (std::size_t at = o.find(tok); at != std::string::npos; at = o.find(tok, at + 1)) {
+            for (const char *before : {"vstore(", "memcpy(&", "vflush(", "vflushd("}) {
+                const std::size_t n = std::strlen(before);
+                if (at >= n && o.compare(at - n, n, before) == 0) return true;
+            }
+            // a lane write: tok.w[k] = (not ==)
+            std::size_t p = at + tok.size();
+            if (o.compare(p, 3, ".w[") == 0 || o.compare(p, 4, ".sw[") == 0) {
+                p = o.find(']', p);
+                if (p != std::string::npos && o.compare(p + 1, 3, " = ") == 0) return true;
+                if (p != std::string::npos && o.compare(p + 1, 4, " |= ") == 0) return true;
+            }
+        }
+        return false;
+    };
+    for (int n = 1; n <= 32; ++n) {
+        const std::string tok = n == 32 ? "r.acc" : std::format("r.vf[{}]", n), local = n == 32 ? "vacc" : std::format("vf{}", n);
+        if (o.find(tok) == std::string::npos) continue;
+        const bool written = written_at(tok);
+        replace_all(o, tok, local);
+        declare += std::format("    Reg128 {} = {};\n", local, tok);
+        if (written) sync += std::format("{} = {}; ", tok, local);
+    }
+    if (declare.empty()) return o;
+    // before the shadows and the integer registers are read (they read these locals now)
+    const std::string mark = "    (void)jpc;\n";
+    const std::size_t body = o.find(mark);
+    if (body == std::string::npos) return o;
+    o.insert(body + mark.size(), declare);
+    if (!sync.empty()) {
+        replace_all(o, "vu::interpret(", sync + "vu::interpret(");
+        replace_all(o, "r.tpc = ", sync + "r.tpc = ");
+        replace_all(o, "efu(r, ", sync + "efu(r, ");
+    }
+    return o;
+}
+
 // The integer register a lower instruction's code writes, or -1.
 int vi_written(const std::string &code) {
     const std::size_t at = code.find("set_vi(r, ");
@@ -1151,7 +1199,7 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         for (const auto &[from, to] : std::initializer_list<std::pair<const char *, const char *>>{
                  {"vaddd(", "vaddn("}, {"vsubd(", "vsubn("}, {"vmuld(", "vmuln("}, {"vmaddd(", "vmaddn("}, {"vmsubd(", "vmsubn("}, {"vshadow(", "vshadow_eager("}, {"vqd(", "vqd_eager("}})
             replace_all(o, from, to);
-        o = local_vi(o);
+        o = local_vf(local_vi(o));
         // A jump to the program's own first pair (a loop over vertices: ~25 % of the hops between programs in Harry Potter 2) goes round in the
         // function: everything the way out does (the flags and the integer registers into the register file) is done, and instead of the hop
         // to the dispatcher, which would look the same program up and call it again, the function starts again at its top (`again:`, before
@@ -1173,7 +1221,7 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         }
         return o;
     }
-    o = local_vi(o);
+    o = local_vf(local_vi(o));
     if (sticky_split) o.insert(0, "template <bool kSticky>\n");
     replace_all(o, "vu::interpret(1, ", "vhop(hop, ");
     if (any_arith) {
@@ -1215,6 +1263,7 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp). 16: VU1 programs keyed by program_key_moved, with the shift `sh` in them.
+// 22: unit-1 float registers and ACC are locals of the function (local_vf, M3a).
 // 21: a lazy program's hop to its own start goes round in its wrapper (as `again:` of the eager ones); with ps2::vu::fast_mode every
 //     unit-1 program is lazy.
 // 20: merge of upstream (EFU/WAITP stalls, Q read decided from the program's own pairs) with the Flipendo line below.
@@ -1222,7 +1271,7 @@ namespace ps2::vurecomp {
 //     data memory; the body hands over with vhop and returns, nothing else touches the registers meanwhile); 18: a jump to the program's
 //     own entry goes round inside the function (again:); 17: a kick goes out one pair late (vu::kick(1, 0xFFFF) after the pair that
 //     follows it). Upstream 17: a read of Q decided from the program's own pairs only (q_read_kind with the entry).
-const char *const kGeneratorVersion = "vurecomp 21";
+const char *const kGeneratorVersion = "vurecomp 22";
 
 // The key a program is built and found under, worked out from its code: VU0 keeps program_key (the address counts), VU1 has program_key_moved
 // (the same code at any address is one program). A recording of the old kind (VU1, its name holds a key that counted the address) is a
