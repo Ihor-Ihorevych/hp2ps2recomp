@@ -50,6 +50,7 @@
 #include "keymap.hpp"
 #include "quickmenu.hpp"
 #include "ps2/crash.hpp"
+#include "ps2/governor.hpp"
 #include "ps2/hitch.hpp"
 #include "ps2/os.hpp"
 #include "ps2/video.hpp"
@@ -1462,12 +1463,17 @@ void pace() {
             const std::string v = ps2::os::env("PS2_CATCHUP");
             return v.empty() ? 4u : static_cast<std::uint64_t>(std::clamp(std::atoi(v.c_str()), 2, 16));
         }();
-        if (g_last && now < g_last + kCatchUp * period) {
+        // the governor (ps2/governor.hpp): how much of this field was left (negative: how late it is), and whether the clock restarts
+        const bool restart = g_last && now >= g_last + kCatchUp * period;
+        double slack_ms = 0.0;
+        if (g_last && !restart) {
             g_last += period;
+            slack_ms = (static_cast<double>(g_last) - static_cast<double>(now)) * 1000.0 / frequency;
             wait_until(g_last);
         } else {
             g_last = now;
         }
+        ps2::governor::note_pace(slack_ms, static_cast<double>(period) * 1000.0 / frequency, restart, g_pipe->tempo() < 0.98);
         // a device that takes far less than the game makes (or none at all) must still hold the game: the old wait, as a ceiling
         const double hold = audio_seconds();
         while (g_pipe->queued_ms() > 3.0 * kSteerMs && audio_seconds() - hold < 1.0) SDL_Delay(1);
@@ -1488,6 +1494,7 @@ void pace() {
         while (g_pipe->full() && audio_seconds() - started < 1.0) SDL_Delay(1);  // at most a second: a stopped device must not hold the game
         const double waited = audio_seconds() - started;
         g_pipe->note_wait(waited);
+        ps2::governor::note_pace(waited * 1000.0, ps2::g_options.pal ? 20.0 : 1000.0 / 60.0, false, g_pipe->tempo() < 0.98);
         note_audio();
         if (!stuck && waited >= 1.0) std::fprintf(stderr, "[audio] the sound device took no sound for a second (unplugged?); the clock paces the game until it does\n");
         stuck = waited >= 1.0;
@@ -1496,10 +1503,14 @@ void pace() {
     const std::uint64_t frequency = SDL_GetPerformanceFrequency();
     const std::uint64_t period = frequency / (ps2::g_options.pal ? 50 : 60);
     const std::uint64_t now = SDL_GetPerformanceCounter();
+    const double period_ms = static_cast<double>(period) * 1000.0 / static_cast<double>(frequency);
     if (g_last && now - g_last < period) {
+        const double slack_ms = static_cast<double>(period - (now - g_last)) * 1000.0 / static_cast<double>(frequency);
         SDL_Delay(static_cast<Uint32>((period - (now - g_last)) * 1000 / frequency));
         g_last += period;
+        ps2::governor::note_pace(slack_ms, period_ms, false, false);
     } else {
+        ps2::governor::note_pace(0.0, period_ms, g_last && now - g_last >= 4 * period, false);
         g_last = now;
     }
 }

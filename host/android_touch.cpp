@@ -3,6 +3,7 @@
 #include <jni.h>
 #include "ps2/video.hpp"
 #include "ps2/prof.hpp"
+#include "ps2/governor.hpp"
 #include <android/log.h>
 #include <atomic>
 #include <cstdio>
@@ -67,12 +68,13 @@ extern "C" JNIEXPORT jintArray JNICALL PS2_JNI_NAME(PS2_JNI_ACTIVITY, nativeThre
     return out;
 }
 
-// PS2_PROF: the phone's thermal state, battery temperature and charging, once a second from the activity
+// The phone's thermal state, battery temperature and charging, once a second from the activity: for PS2_PROF's output and the governor
 extern "C" JNIEXPORT void JNICALL PS2_JNI_NAME(PS2_JNI_ACTIVITY, nativeDeviceNote)(JNIEnv *env, jclass, jstring text) {
     if (!text) return;
     const char *chars = env->GetStringUTFChars(text, nullptr);
     if (chars) {
         ps2::prof::set_note(chars);
+        ps2::governor::note_device(chars);  // a hot phone draws fewer pictures (ps2/governor.hpp)
         env->ReleaseStringUTFChars(text, chars);
     }
 }
